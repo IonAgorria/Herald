@@ -1,22 +1,17 @@
 use std::{fmt, io};
-use std::net::SocketAddr;
+use std::mem::size_of;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::Relaxed;
 use std::time::{Duration, Instant};
-use futures_util::{SinkExt, StreamExt};
-use tokio::net::TcpStream;
+use futures_util::{Sink, SinkExt, StreamExt};
+use futures_util::stream::BoxStream;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::task::JoinHandle;
 use tokio_util::bytes::Bytes;
 use crate::relay::messages::NetRelayMessageRelay;
-use crate::relay::netconnection_transport::{
-    NetConnectionFramedRead,
-    NetConnectionFramedWrite,
-    NetTransportRead,
-    NetTransportWrite
-};
 use crate::utils::config_from_str;
 
 pub type NETID = u64;
@@ -29,6 +24,8 @@ pub const NETID_ALL: NETID = 3;
 pub const NETID_CLIENTS_RELAY_START: NETID = 0x10000;
 
 type NetConnectionClosed = Arc<AtomicBool>;
+pub type NetConnectionMessageStream = BoxStream<'static, io::Result<NetConnectionMessage>>;
+pub type NetConnectionMessageSink = Pin<Box<dyn Sink<NetConnectionMessage, Error = io::Error> + Send + 'static>>;
 
 #[derive(Debug)]
 pub struct NetConnectionMessage {
@@ -40,6 +37,39 @@ pub struct NetConnectionMessage {
     pub compressed: bool,
     ///Actual data contained in the message
     pub data: Bytes,
+}
+
+impl NetConnectionMessage {
+    pub const MESSAGE_MAX_SIZE: usize = 32 * 1024 * 1024;
+    //const MESSAGE_COMPRESSION_SIZE: usize = 128 * 1024;
+    ///Specifies this message contains compressed payload
+    pub const FLAG_COMPRESSED: u16 = 1 << 0;
+    pub const HEADER_SIZE: usize = 8;
+    pub const HEADER_MAGIC: u64 = 0xDE000000000000CA;
+    pub const HEADER_MASK: u64  = 0xFF000000000000FF;
+    pub const SIZE_OF_NETID: usize = size_of::<NETID>();
+
+    pub fn generate_header(&self) -> Result<(u64, usize), usize> {
+        //Get data and total message length
+        let mut data_len = self.data.len();
+        data_len += Self::SIZE_OF_NETID * 2;
+        let total_len = data_len + Self::HEADER_SIZE;
+
+        //Check msg max size
+        if 0 == total_len || total_len > Self::MESSAGE_MAX_SIZE {
+            return Err(total_len);
+        }
+
+        //Set header
+        let mut flags: u16 = 0;
+        if self.compressed {
+            flags |= Self::FLAG_COMPRESSED;
+        }
+        let mut header: u64 = Self::HEADER_MAGIC;
+        header |= (flags as u64) << 8;
+        header |= (data_len as u64) << 24;
+        return Ok((header, total_len));
+    }
 }
 
 pub enum NetConnectionRead<T> {
@@ -58,10 +88,9 @@ pub struct NetConnectionStream {
 }
 
 impl NetConnectionStream {
-    pub fn new(closed: NetConnectionClosed, buffer_size: usize, stream: NetConnectionFramedRead) -> Self {
-        let info = stream.get_ref().to_string();
+    pub fn new(closed: NetConnectionClosed, buffer_size: usize, info: String, stream: NetConnectionMessageStream) -> Self {
         let (queue_tx, queue_rx) = mpsc::channel(buffer_size);
-        let task = tokio::spawn(Self::task_entry(stream, queue_tx));
+        let task = tokio::spawn(Self::task_entry(info.clone(), stream, queue_tx));
         Self {
             closed,
             info,
@@ -84,10 +113,10 @@ impl NetConnectionStream {
     }
     
     async fn task_entry(
-        mut stream: NetConnectionFramedRead,
+        info: String,
+        mut stream: NetConnectionMessageStream,
         queue_tx: mpsc::Sender<NetConnectionRead<NetConnectionMessage>>
     ) {
-        let info = stream.get_ref().to_string();
         loop {
             let res = match stream.next().await {
                 Some(Ok(msg)) => NetConnectionRead::Data(msg),
@@ -159,8 +188,7 @@ impl NetConnectionStream {
 enum NetConnectionSinkMessage {
     CloseCode(u32),
     Flush,
-    Feed(NetConnectionMessage),
-    Send(NetConnectionMessage),
+    Send(NetConnectionMessage, bool),
 }
 
 #[derive(Debug)]
@@ -180,11 +208,10 @@ pub struct NetConnectionSink {
 }
 
 impl NetConnectionSink {
-    pub fn new(closed: NetConnectionClosed, buffer_size: usize, sink: NetConnectionFramedWrite) -> Self {
-        let info = sink.get_ref().to_string();
+    pub fn new(closed: NetConnectionClosed, buffer_size: usize, info: String, sink: NetConnectionMessageSink) -> Self {
         let (queue_tx, queue_rx) = mpsc::channel(buffer_size);
         //Task that will poll the channel and send over sink, will finish once sink or channel is closed
-        tokio::spawn(Self::task_entry(sink, queue_rx, closed.clone()));
+        tokio::spawn(Self::task_entry(info.clone(), sink, queue_rx, closed.clone()));
         Self {
             closed,
             info,
@@ -194,11 +221,11 @@ impl NetConnectionSink {
     }
 
     async fn task_entry(
-        mut sink: NetConnectionFramedWrite,
+        info: String,
+        mut sink: NetConnectionMessageSink,
         mut queue_rx: mpsc::Receiver<NetConnectionSinkMessage>,
         closed: NetConnectionClosed
     ) {
-        let info = sink.get_ref().to_string();
         let mut close_code = 0;
         //Keep going until None is returned which means is closed + no more msgs in queue
         while let Some(action) = queue_rx.recv().await {
@@ -208,8 +235,16 @@ impl NetConnectionSink {
                     Ok(())
                 },
                 NetConnectionSinkMessage::Flush => sink.flush().await,
-                NetConnectionSinkMessage::Feed(msg) => { sink.feed(msg).await },
-                NetConnectionSinkMessage::Send(msg) => { sink.send(msg).await },
+                NetConnectionSinkMessage::Send(msg, flush) => {
+                    let res = sink.feed(msg).await;
+                    if res.is_err() {
+                        res
+                    } else if flush {
+                        sink.flush().await
+                    } else {
+                        Ok(())
+                    }
+                },
             } {
                 log::error!("NetConnectionSink::task action error {:?}", err);
             }
@@ -218,7 +253,7 @@ impl NetConnectionSink {
         match Bytes::try_from(NetRelayMessageRelay::Close(close_code)) {
             Err(err) => log::error!("NetConnectionSink::task send close error {:?}", err),
             Ok(data) => {
-                let _ = sink.send(NetConnectionMessage {
+                let _ = sink.feed(NetConnectionMessage {
                     source_netid: NETID_RELAY,
                     destination_netid: NETID_NONE,
                     compressed: false,
@@ -226,6 +261,7 @@ impl NetConnectionSink {
                 }).await;
             }
         }
+        let _ = sink.flush().await;
         let _ = sink.close().await;
         closed.store(true, Relaxed);
         log::trace!("NetConnectionSink::task {:} finished", info);
@@ -262,11 +298,7 @@ impl NetConnectionSink {
 
     #[allow(dead_code)]
     pub async fn try_send_message(&self, msg: NetConnectionMessage, flush: bool) -> Result<(), NetConnectionWrite> {
-        self.try_send(if flush {
-            NetConnectionSinkMessage::Send(msg)
-        } else {
-            NetConnectionSinkMessage::Feed(msg)
-        })
+        self.try_send(NetConnectionSinkMessage::Send(msg, flush))
     }
 
     async fn send(&self, msg: NetConnectionSinkMessage) -> Result<(), NetConnectionWrite> {
@@ -285,11 +317,7 @@ impl NetConnectionSink {
     }
     
     pub async fn send_message(&self, msg: NetConnectionMessage, flush: bool) -> Result<(), NetConnectionWrite> {
-        self.send(if flush {
-            NetConnectionSinkMessage::Send(msg)
-        } else {
-            NetConnectionSinkMessage::Feed(msg)
-        }).await
+        self.send(NetConnectionSinkMessage::Send(msg, flush)).await
     }
 
     pub async fn send_relay_message(&self, msg: NetRelayMessageRelay, flush: bool) -> Result<(), NetConnectionWrite> {
@@ -309,45 +337,27 @@ impl NetConnectionSink {
 #[derive(Debug)]
 pub struct NetConnection {
     last_contact: Instant,
+    timeout: Duration,
     sink: NetConnectionSink,
     stream: NetConnectionStream,
 }
 
 impl NetConnection {
-    pub fn from_streams(sink: NetConnectionSink, stream: NetConnectionStream) -> Self {
+    pub fn from_parts(sink: NetConnectionSink, stream: NetConnectionStream) -> Self {
         Self {
             last_contact: Instant::now(),
+            timeout: Duration::ZERO,
             sink,
             stream,
         }
     }
 
-    pub fn from_transport(write: NetTransportWrite, read: NetTransportRead) -> Self {
+    pub fn from_streams(info: String, sink: NetConnectionMessageSink, stream: NetConnectionMessageStream) -> Self {
         let buffer_size = config_from_str::<usize>("SERVER_CONNECTION_BUFFER_SIZE", 50);
         let closed = NetConnectionClosed::default();
-        Self::from_streams(
-            NetConnectionSink::new(closed.clone(), buffer_size, write.into_framed()),
-            NetConnectionStream::new(closed, buffer_size, read.into_framed())
-        )
-    }
-    
-    pub fn from_transport_tcp(addr: SocketAddr, stream: TcpStream) -> Self {
-        if let Err(err) = stream.set_nodelay(true) {
-            log::error!("TCP {:} error setting nodelay: {:}", addr, err);
-        }
-        if let Err(err) = stream.set_linger(Some(Duration::from_secs(1))) {
-            log::error!("TCP {:} error setting linger: {:}", addr, err);
-        }
-        let (read, write) = stream.into_split();
-        Self::from_transport(
-            NetTransportWrite::TCP {
-                addr: addr.clone(),
-                write,
-            },
-            NetTransportRead::TCP {
-                addr: addr.clone(),
-                read,
-            },
+        Self::from_parts(
+            NetConnectionSink::new(closed.clone(), buffer_size, info.clone(), sink),
+            NetConnectionStream::new(closed, buffer_size, info, stream)
         )
     }
 
@@ -381,14 +391,20 @@ impl NetConnection {
         self.stream.is_closed() || self.sink.is_closed()
     }
     
+    pub fn set_timeout(&mut self, timeout: Duration) {
+        self.timeout = timeout;
+    }
+    
     pub fn update_last_contact(&mut self) {
         self.last_contact = Instant::now();
     }
 
-    pub fn is_last_contact_more_than(&self, millis: u64) -> bool {
-        self.last_contact
-            .elapsed()
-            .as_millis() > millis as u128
+    pub fn is_last_contact_more_than(&self, duration: Duration) -> bool {
+        self.last_contact.elapsed() > duration
+    }
+
+    pub fn has_contact_timeout(&self) -> bool {
+        !self.timeout.is_zero() && self.is_last_contact_more_than(self.timeout)
     }
 
     pub fn close(&mut self, code: u32) {

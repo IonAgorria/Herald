@@ -9,9 +9,8 @@ use tokio_util::bytes::{Buf, BufMut, Bytes};
 use serde::{Serialize};
 use crate::lobby::lobby_manager::RoomJoinInfo;
 use crate::lobby::room_info::{LobbyWithRooms, RoomInfo};
-use crate::relay::netconnection_codec::NETCONNECTION_MESSAGE_FLAG_COMPRESSED;
-use crate::relay::netconnection::{NETID, NETID_ALL, NETID_HOST, NETID_NONE, NETID_RELAY};
-use crate::relay::netconnection::NetConnectionMessage;
+use crate::netconnection::{NETID, NETID_ALL, NETID_HOST, NETID_NONE, NETID_RELAY};
+use crate::netconnection::NetConnectionMessage;
 use crate::utils::time::{duration_since_timestamp, get_timestamp};
 use crate::utils::xprm::serialize_xprm_or_json;
 
@@ -123,7 +122,7 @@ impl NetRelayMessagePeer {
     pub fn from_message(mut msg: NetConnectionMessage) -> Result<Self, NetRelayMessageError> {
         if msg.compressed {
             //Shouldn't be compressed
-            return Err(NetRelayMessageError::UnsupportedFlag(NETCONNECTION_MESSAGE_FLAG_COMPRESSED));
+            return Err(NetRelayMessageError::UnsupportedFlag(NetConnectionMessage::FLAG_COMPRESSED));
         } else if msg.destination_netid != NETID_RELAY {
             return Err(NetRelayMessageError::WrongDestinationNETID(msg.destination_netid));
         }

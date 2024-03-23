@@ -7,7 +7,7 @@ use arc_swap::ArcSwap;
 use crate::AppData;
 use crate::lobby::room_info::{RoomInfo, RoomID};
 use crate::lobby::room::Room;
-use crate::relay::netconnection::{NetConnection, NETID_HOST};
+use crate::netconnection::{NetConnection, NETID_HOST};
 use crate::relay::session_manager::SessionManagerSender;
 
 type RoomMap = HashMap<RoomID, Room>;

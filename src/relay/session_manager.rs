@@ -9,7 +9,7 @@ use crate::AppData;
 use crate::lobby::lobby_manager::LobbyManager;
 use crate::lobby::room_info::LobbyWithRooms;
 use crate::relay::messages::{NetRelayMessagePeer, NetRelayMessageRelay};
-use crate::relay::netconnection::{NETID_NONE, NetConnection, NetConnectionRead};
+use crate::netconnection::{NETID_NONE, NetConnection, NetConnectionRead};
 use crate::utils::config_from_str;
 
 enum SessionManagerMessage {
@@ -32,7 +32,6 @@ pub struct SessionManager {
 struct SessionManagerState {
     running: bool,
     poll_interval: u64,
-    peer_timeout: u64,
     queue_tx: SessionManagerSender,
     queue_rx: mpsc::Receiver<SessionManagerMessage>,
     peers: Box<Vec<NetConnection>>,
@@ -43,14 +42,12 @@ struct SessionManagerState {
 impl SessionManager {
     pub fn init(app_data: Arc<AppData>) -> Self {
         let poll_interval = config_from_str::<u64>("SERVER_SESSION_MANAGER_POLL_INTERVAL", 10);
-        let peer_timeout = config_from_str::<u64>("SERVER_SESSION_MANAGER_PEER_TIMEOUT", 5000);
         let channel_size = config_from_str::<usize>("SERVER_SESSION_MANAGER_MESSAGES_MAX", 1000);
         let (queue_tx, queue_rx) = mpsc::channel(channel_size);
         let session_manager_sender = SessionManagerSender(queue_tx.clone());
         let state = SessionManagerState {
             running: true,
             poll_interval,
-            peer_timeout,
             queue_tx: session_manager_sender.clone(),
             queue_rx,
             peers: Default::default(),
@@ -164,11 +161,11 @@ impl SessionManagerState {
 
         for conn in peers.into_iter() {
             let queue_tx = self.queue_tx.clone();
-            tokio::spawn(Self::process_peer_connection(self.peer_timeout, conn, queue_tx));
+            tokio::spawn(Self::process_peer_connection(conn, queue_tx));
         }
     }
 
-    async fn process_peer_connection(peer_timeout: u64, mut conn: NetConnection, queue_tx: SessionManagerSender) {
+    async fn process_peer_connection(mut conn: NetConnection, queue_tx: SessionManagerSender) {
         let message = match conn.stream_mut().read_message().await {
             NetConnectionRead::Closed => {
                 //Nothing to do here since is closed
@@ -196,7 +193,7 @@ impl SessionManagerState {
         };
         
         //Check if peer took too much time to answer
-        if conn.is_last_contact_more_than(peer_timeout) {
+        if conn.has_contact_timeout() {
             //We just close and drop it here, no point going further to be discarded anyway
             log::info!("Peer {:} took too long to contact", conn);
             return; //Conn dropped here

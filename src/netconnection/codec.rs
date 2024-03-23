@@ -7,19 +7,9 @@ use tokio_util::bytes::{Buf, BufMut, BytesMut};
 use tokio::io::{AsyncRead, AsyncWrite};
 use std::io;
 use std::fmt;
-use std::mem::{size_of, size_of_val};
+use std::mem::size_of_val;
 use codec::{Decoder, Encoder};
-use crate::relay::netconnection::{NetConnectionMessage, NETID};
- 
-const MESSAGE_HEADER_SIZE: usize = 8;
-const MESSAGE_MAX_SIZE: usize = 32 * 1024 * 1024;
-//const MESSAGE_COMPRESSION_SIZE: usize = 128 * 1024;
-///Specifies this message contains compressed payload
-pub const NETCONNECTION_MESSAGE_FLAG_COMPRESSED: u16 = 1 << 0;
-const MESSAGE_HEADER_MAGIC: u64 = 0xDE000000000000CA;
-const MESSAGE_HEADER_MASK: u64  = 0xFF000000000000FF;
-
-const SIZE_OF_NETID: usize = size_of::<NETID>();
+use crate::netconnection::NetConnectionMessage;
 
 #[derive(Debug)]
 struct HeaderParts {
@@ -78,15 +68,15 @@ impl NetConnectionCodecDecoder {
     }
     
     fn decode_head(&mut self, src: &mut BytesMut) -> io::Result<Option<HeaderParts>> {
-        if src.len() < MESSAGE_HEADER_SIZE {
+        if src.len() < NetConnectionMessage::HEADER_SIZE {
             // Not enough data
             return Ok(None);
         }
         
         //Get the header
         let header: u64 = src.get_u64();
-        assert_eq!(size_of_val(&header), MESSAGE_HEADER_SIZE);
-        if (header & MESSAGE_HEADER_MASK) != MESSAGE_HEADER_MAGIC {
+        assert_eq!(size_of_val(&header), NetConnectionMessage::HEADER_SIZE);
+        if (header & NetConnectionMessage::HEADER_MASK) != NetConnectionMessage::HEADER_MAGIC {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 NetConnectionCodecError::HeaderMagic(header),
@@ -96,11 +86,11 @@ impl NetConnectionCodecDecoder {
         //Parse header
         let data_length: usize = ((header >> 24) & 0xFFFF_FFFF) as usize;
         let msg_flags: u16 = ((header >> 8) & 0xFFFF) as u16;
-        let flag_compressed = 0 != (msg_flags & NETCONNECTION_MESSAGE_FLAG_COMPRESSED);
+        let flag_compressed = 0 != (msg_flags & NetConnectionMessage::FLAG_COMPRESSED);
         
         //Calculate and check total size
-        let message_size = data_length + MESSAGE_HEADER_SIZE;
-        if 0 == message_size || message_size > MESSAGE_MAX_SIZE {
+        let message_size = data_length + NetConnectionMessage::HEADER_SIZE;
+        if 0 == message_size || message_size > NetConnectionMessage::MESSAGE_MAX_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 NetConnectionCodecError::WrongLength(message_size),
@@ -129,7 +119,7 @@ impl NetConnectionCodecDecoder {
         //Extract NETID before actual data
         let source_netid = src.get_u64();
         let destination_netid = src.get_u64();
-        data_len -= SIZE_OF_NETID * 2;
+        data_len -= NetConnectionMessage::SIZE_OF_NETID * 2;
 
         //Read the message content and message struct
         Some(NetConnectionMessage {
@@ -162,7 +152,7 @@ impl Decoder for NetConnectionCodecDecoder {
                     self.header = None;
 
                     // Make sure the buffer has enough space to read the next head
-                    src.reserve(MESSAGE_HEADER_SIZE.saturating_sub(src.len()));
+                    src.reserve(NetConnectionMessage::HEADER_SIZE.saturating_sub(src.len()));
 
                     Ok(Some(data))
                 }
@@ -209,34 +199,21 @@ impl Encoder<NetConnectionMessage> for NetConnectionCodecEncoder {
     type Error = io::Error;
 
     fn encode(&mut self, item: NetConnectionMessage, dst: &mut BytesMut) -> Result<(), io::Error> {
-        //Get data and total message length
-        let mut data_len = item.data.len();
-        data_len += SIZE_OF_NETID * 2;
-        let total_len = data_len + MESSAGE_HEADER_SIZE;
-
-        //Check msg max size
-        if 0 == total_len || total_len > MESSAGE_MAX_SIZE {
-            return Err(io::Error::new(
+        //Add header
+        let (header, total_len) = item.generate_header()
+            .map_err(|len| io::Error::new(
                 io::ErrorKind::InvalidInput,
-                NetConnectionCodecError::WrongLength(total_len),
-            ));
-        }
+                NetConnectionCodecError::WrongLength(len),
+            ))?;
 
         // Reserve capacity in the destination buffer to fit the frame and
         // length field (plus adjustment).
         dst.reserve(total_len);
-
+        
         //Set header
-        let mut flags: u16 = 0;
-        if item.compressed {
-            flags |= NETCONNECTION_MESSAGE_FLAG_COMPRESSED;
-        }
-        let mut header: u64 = MESSAGE_HEADER_MAGIC;
-        header |= (flags as u64) << 8;
-        header |= (data_len as u64) << 24;
         dst.put_u64(header);
         
-        //Add soource and destination NETID
+        //Add source and destination NETID
         dst.put_u64(item.source_netid);
         dst.put_u64(item.destination_netid);
 

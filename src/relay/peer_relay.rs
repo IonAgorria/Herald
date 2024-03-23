@@ -11,7 +11,7 @@ use futures_util::{stream, StreamExt};
 use tokio::{select, time};
 use tokio_util::sync::CancellationToken;
 use crate::lobby::room_info::{RoomID, RoomInfo};
-use crate::relay::netconnection::{NetConnection, NetConnectionMessage, NetConnectionRead, NetConnectionSink, NETID, NETID_ALL, NETID_NONE, NETID_RELAY};
+use crate::netconnection::{NetConnection, NetConnectionMessage, NetConnectionRead, NetConnectionSink, NETID, NETID_ALL, NETID_NONE, NETID_RELAY};
 use crate::relay::messages::{NetRelayMessagePeer, NetRelayMessageRelay};
 use crate::utils::config_from_str;
 use crate::utils::time::IntervalTimer;
@@ -70,14 +70,12 @@ pub struct PeerRelayConfig {
     pub update_interval: Duration,
     ///How many messages to poll per peer on each update
     pub msgs_per_poll: usize,
-    ///Timeout for clients
-    pub peer_timeout: u64,
     ///Timer for status update
     pub status_timer: IntervalTimer,
     ///Timer for ping
     pub ping_timer: IntervalTimer,
     ///How long to wait before pinging
-    pub ping_wait_time: u64,
+    pub ping_wait_time: Duration,
     ///Token to cancel task
     pub cancellation: CancellationToken,
     ///Max amount of messages to poll from channels on each update
@@ -89,15 +87,15 @@ impl PeerRelayConfig {
         let update_interval = config_from_str::<u64>("SERVER_ROOM_UPDATE_INTERVAL", 10);
         let status_interval = config_from_str::<u64>("SERVER_ROOM_STATUS_INTERVAL", 1000);
         let ping_interval = config_from_str::<u64>("SERVER_ROOM_PING_POLL_INTERVAL", 3000);
+        let ping_wait_time = config_from_str::<u64>("SERVER_ROOM_PING_WAIT_TIME", ping_interval + 1000);
         Self {
             room_id,
             update_interval: Duration::from_millis(update_interval),
             channel_msgs_per_update: config_from_str::<usize>("SERVER_ROOM_TASK_CHANNEL_MSGS_PER_UPDATE", 10),
             msgs_per_poll: config_from_str::<usize>("SERVER_ROOM_MESSAGES_PER_POLL", 10),
-            peer_timeout: config_from_str::<u64>("SERVER_ROOM_PEER_TIMEOUT", 10000),
             status_timer: IntervalTimer::new(Duration::from_millis(status_interval)),
             ping_timer: IntervalTimer::new(Duration::from_millis(ping_interval)),
-            ping_wait_time: config_from_str::<u64>("SERVER_ROOM_PING_WAIT_TIME", ping_interval + 1000),
+            ping_wait_time: Duration::from_millis(ping_wait_time),
             cancellation: CancellationToken::new(),
         }
     }
@@ -273,6 +271,9 @@ impl PeerRelay {
         //Notify peers about it 
         let self_str = self.to_string();
         for conn in self.peers.values_mut() {
+            if conn.is_closed() {
+                continue;
+            }
             if let Err(err) = conn.sink().send_relay_message(
                 NetRelayMessageRelay::RemovePeer(netid), false
             ).await {
@@ -369,7 +370,7 @@ impl PeerRelay {
             }
             
             //Check timeout
-            if conn.is_last_contact_more_than(self.config.peer_timeout) {
+            if conn.has_contact_timeout() {
                 log::info!("{:} peer {:} took too long to contact", self_str, conn);
                 conn.close(917347483);
                 continue

@@ -4,6 +4,7 @@ mod utils;
 mod http;
 mod lobby;
 mod relay;
+mod netconnection;
 #[macro_use]
 mod macros;
 

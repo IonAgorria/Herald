@@ -6,7 +6,7 @@ use tokio::sync::mpsc::error::TryRecvError;
 use tokio_util::sync::CancellationToken;
 use crate::lobby::room_info::RoomInfo;
 use crate::relay::peer_relay::{PeerRelay, PeerRelayCloseMode, PeerRelayConfig, PeerRelayMessage, PeerRelayOwnership};
-use crate::relay::netconnection::{NetConnection, NETID, NETID_CLIENTS_RELAY_START};
+use crate::netconnection::{NetConnection, NETID, NETID_CLIENTS_RELAY_START};
 use crate::relay::session_manager::SessionManagerSender;
 use crate::utils::config_from_str;
 
