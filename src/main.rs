@@ -25,13 +25,13 @@ async fn root() -> impl actix_web::Responder {
 
 pub struct AppData {
     tcp_public_address: String,
+    ws_public_address: String,
     allowed_games_types: Vec<String>,
     room_infos: lobby::lobby_manager::CurrentRoomInfos,
 }
 
-fn run_http_server(appdata: Arc<AppData>) -> std::io::Result<JoinHandle<std::io::Result<()>>> {
+fn run_http_server(http_bind_address: String, appdata: Arc<AppData>) -> std::io::Result<JoinHandle<std::io::Result<()>>> {
     let logger_format = config_string("SERVER_LOGGER_FORMAT", "[%a][%{r}a] \"%r\" %s %b %D \"%{User-Agent}i\"");
-    let http_bind_address = config_string("SERVER_HTTP_BIND_ADDRESS", "0.0.0.0:8888");
     let workers = config_from_str::<usize>("SERVER_WORKERS", 0);
     let workers_blocking = config_from_str::<usize>("SERVER_WORKERS_BLOCKING", 0);
     let keep_alive = config_from_str::<u64>("SERVER_KEEP_ALIVE", 0);
@@ -41,7 +41,7 @@ fn run_http_server(appdata: Arc<AppData>) -> std::io::Result<JoinHandle<std::io:
         .name("actix_system".to_string())
         .spawn(move || {
             //Launch the actix system and web server
-            log::info!("Listening HTTP at: {}", http_bind_address);
+            log::info!("Binding HTTP listener at: {}", http_bind_address);
             let system = actix_web::rt::System::new();
             system.block_on(async move {
                 let mut server = HttpServer::new(move || {
@@ -82,11 +82,14 @@ async fn setup_app() -> std::io::Result<()> {
     if tcp_public_address.is_empty() {
         return Err(std::io::Error::other("SERVER_TCP_PUBLIC_ADDRESS not configured!"));
     }
-    log::info!("Public relay address: {}", tcp_public_address);
+    let http_bind_address = config_string("SERVER_HTTP_BIND_ADDRESS", "0.0.0.0:8888");
+    let http_public_address = config_string("SERVER_HTTP_PUBLIC_ADDRESS", http_bind_address.as_str());
+    log::info!("Public relay address:\n\tHTTP = {}\n\tTCP = {}", http_public_address, tcp_public_address);
     
     //Create shared app state for request handlers
     let appdata = Arc::new(AppData {
         tcp_public_address,
+        ws_public_address: http_public_address + "/ws",
         allowed_games_types,
         room_infos: Default::default(),
     });
@@ -95,7 +98,7 @@ async fn setup_app() -> std::io::Result<()> {
     relay::utils::init(appdata.clone()).await?;
 
     //Spin main HTTP server and wait, will finish if SIGINT is received;
-    let actix_thread = run_http_server(appdata)?;
+    let actix_thread = run_http_server(http_bind_address, appdata)?;
     actix_thread.join().unwrap_or_else(|err| {
         log::error!("Error occurred joining actix system thread: {:?}", err);
         Err(std::io::Error::other("Thread JoinHandle error"))

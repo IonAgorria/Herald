@@ -24,7 +24,8 @@ pub async fn list(data: Data<AppData>, query: Query<LobbyListQuery>, req: HttpRe
     let response = LobbyListResponse {
         lobbies: &[
             LobbyWithRooms {
-                host: data.tcp_public_address.clone(),
+                host_tcp: data.tcp_public_address.clone(),
+                host_ws: data.ws_public_address.clone(),
                 rooms,
             }
         ]

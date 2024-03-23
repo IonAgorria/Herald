@@ -7,7 +7,8 @@ pub type RoomID = u64;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct LobbyWithRooms {
-    pub host: String,
+    pub host_tcp: String,
+    pub host_ws: String,
     pub rooms: Vec<RoomInfo>,
 }
 

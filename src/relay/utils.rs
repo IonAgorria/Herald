@@ -33,9 +33,9 @@ async fn tcp_listener(session_manager: SessionManagerSender) -> Result<JoinHandl
             return Err(Error::other(err));
         }
     };
+    log::info!("Binding TCP listener at: {:}", socketaddr);
     let listener = match TcpListener::bind(socketaddr).await {
         Ok(l) => {
-            log::info!("Listening relay at: {:}", socketaddr);
             l
         }
         Err(err) => {

@@ -232,7 +232,8 @@ impl SessionManagerState {
                 let room_infos_guard = app_data.room_infos.load();
                 let lobbies = vec![
                     LobbyWithRooms {
-                        host: app_data.tcp_public_address.clone(),
+                        host_tcp: app_data.tcp_public_address.clone(),
+                        host_ws: app_data.ws_public_address.clone(),
                         rooms: LobbyManager::filter_room_by_game_type(&room_infos_guard, &game_type),
                     }
                 ];
