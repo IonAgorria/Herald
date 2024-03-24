@@ -8,6 +8,10 @@ mod netconnection;
 #[macro_use]
 mod macros;
 
+use std::io;
+use std::net::SocketAddr;
+use std::str::FromStr;
+use futures_util::TryStreamExt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::JoinHandle;
@@ -16,6 +20,9 @@ use actix_web::{App, HttpServer};
 use actix_web::http::KeepAlive;
 use actix_web::middleware::Logger;
 use actix_web::web::Data;
+use tokio::net::TcpListener;
+use crate::netconnection::{codec, NetConnection, StreamMessage};
+use crate::relay::session_manager::{SessionManager, SessionManagerSender};
 use crate::utils::{config_from_str, config_string};
 
 #[actix_web::get("/")]
@@ -28,6 +35,7 @@ pub struct AppData {
     ws_public_address: String,
     allowed_games_types: Vec<String>,
     room_infos: lobby::lobby_manager::CurrentRoomInfos,
+    session_manager: SessionManagerSender,
 }
 
 fn run_http_server(http_bind_address: String, appdata: Arc<AppData>) -> std::io::Result<JoinHandle<std::io::Result<()>>> {
@@ -72,6 +80,60 @@ fn run_http_server(http_bind_address: String, appdata: Arc<AppData>) -> std::io:
     }
 }
 
+pub async fn tcp_listener(session_manager: SessionManagerSender) -> Result<(), io::Error> {
+    let tcp_address = config_string("SERVER_TCP_BIND_ADDRESS", "0.0.0.0:11654");
+    let tcp_linger = config_from_str::<u64>("SERVER_TCP_LINGER", 1);
+    let tcp_timeout = config_from_str::<u64>("SERVER_TCP_TIMEOUT", 10000);
+    let socketaddr = match SocketAddr::from_str(tcp_address.as_str()) {
+        Ok(a) => a,
+        Err(err) => {
+            log::error!("TCP listener unknown address format: {:} error: {:}", tcp_address, err);
+            return Err(io::Error::other(err));
+        }
+    };
+    log::info!("Binding TCP listener at: {:}", socketaddr);
+    let listener = match TcpListener::bind(socketaddr).await {
+        Ok(l) => {
+            l
+        }
+        Err(err) => {
+            log::error!("Couldn't bind relay to address! {:} {:?}", socketaddr, err);
+            return Err(err);
+        }
+    };
+    tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((stream, addr)) =>  {
+                    log::info!("TCP Incoming connection {:}", addr);
+                    if let Err(err) = stream.set_nodelay(true) {
+                        log::error!("TCP {:} error setting nodelay: {:}", addr, err);
+                    }
+                    if let Err(err) = stream.set_linger(Some(Duration::from_secs(tcp_linger))) {
+                        log::error!("TCP {:} error setting linger: {:}", addr, err);
+                    }
+                    let (read, write) = stream.into_split();
+                    let stream = codec::NetConnectionCodecDecoder::new_framed(read)
+                        .map_ok(|msg| StreamMessage::Message(msg));
+                    let mut connection = NetConnection::from_streams(
+                        format!("TCP({})", addr),
+                        Box::pin(codec::NetConnectionCodecEncoder::new_framed(write)),
+                        Box::pin(stream)
+                    );
+                    connection.stream_mut().set_timeout(Duration::from_millis(tcp_timeout));
+                    session_manager.incoming_connection(connection).await;
+                }
+                Err(err) => {
+                    log::info!("TCP listener accept error: {:}", err);
+                    return Result::<(), io::Error>::Err(err)
+                }
+            }
+        }
+    });
+
+    Ok(())
+}
+
 async fn setup_app() -> std::io::Result<()> {
     let allowed_games_types: Vec<String> = dotenvy::var("SERVER_ALLOWED_GAME_TYPES")
         .unwrap_or_default()
@@ -85,27 +147,35 @@ async fn setup_app() -> std::io::Result<()> {
     let http_bind_address = config_string("SERVER_HTTP_BIND_ADDRESS", "0.0.0.0:8888");
     let http_public_address = config_string("SERVER_HTTP_PUBLIC_ADDRESS", http_bind_address.as_str());
     log::info!("Public relay address:\n\tHTTP = {}\n\tTCP = {}", http_public_address, tcp_public_address);
-    
+        
     //Create shared app state for request handlers
-    let appdata = Arc::new(AppData {
+    let (session_manager_queue_tx, session_manager_queue_rx) = SessionManagerSender::new();
+    let app_data = Arc::new(AppData {
         tcp_public_address,
         ws_public_address: http_public_address + "/ws",
         allowed_games_types,
         room_infos: Default::default(),
+        session_manager: session_manager_queue_tx,
     });
-    
+
     //Setup relay
-    relay::utils::init(appdata.clone()).await?;
+    SessionManager::init(session_manager_queue_rx, app_data.clone());
+    app_data.session_manager.ping().await;
+
+    //Start relay listener
+    if let Err(err) = tcp_listener(app_data.session_manager.clone()).await {
+        return Err(err);
+    }
 
     //Spin main HTTP server and wait, will finish if SIGINT is received;
-    let actix_thread = run_http_server(http_bind_address, appdata)?;
+    let actix_thread = run_http_server(http_bind_address, app_data)?;
     actix_thread.join().unwrap_or_else(|err| {
         log::error!("Error occurred joining actix system thread: {:?}", err);
-        Err(std::io::Error::other("Thread JoinHandle error"))
+        Err(io::Error::other("Thread JoinHandle error"))
     })
 }
 
-fn main() -> std::io::Result<()> {
+fn main() -> io::Result<()> {
     //Setup env logger
     let rust_log = config_string("RUST_LOG", "INFO");
     env_logger::init_from_env(env_logger::Env::default().default_filter_or(rust_log.to_uppercase()));

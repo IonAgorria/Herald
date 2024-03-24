@@ -17,15 +17,15 @@ struct LobbyListQuery {
 }
 
 #[get("/lobby/list")]
-pub async fn list(data: Data<AppData>, query: Query<LobbyListQuery>, req: HttpRequest) -> impl Responder {
+pub async fn list(app_data: Data<AppData>, query: Query<LobbyListQuery>, req: HttpRequest) -> impl Responder {
     let game_type = query.game_type.to_owned().unwrap_or_default();
-    let room_infos_guard = &data.room_infos.load();
+    let room_infos_guard = &app_data.room_infos.load();
     let rooms = LobbyManager::filter_room_by_game_type(room_infos_guard, &game_type);
     let response = LobbyListResponse {
         lobbies: &[
             LobbyWithRooms {
-                host_tcp: data.tcp_public_address.clone(),
-                host_ws: data.ws_public_address.clone(),
+                host_tcp: app_data.tcp_public_address.clone(),
+                host_ws: app_data.ws_public_address.clone(),
                 rooms,
             }
         ]

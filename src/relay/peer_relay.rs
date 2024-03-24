@@ -227,7 +227,7 @@ impl PeerRelay {
             return;
         }
         self.send_list_peers(conn.sink()).await;
-        conn.update_last_contact();
+        conn.stream_mut().update_last_contact();
         self.peers.insert(conn.get_netid(), conn);
     }
 
@@ -319,7 +319,7 @@ impl PeerRelay {
     
     async fn ping_peers(&mut self) {
         for conn in self.peers.values() {
-            if !conn.is_last_contact_more_than(self.config.ping_wait_time) {
+            if !conn.stream().is_last_contact_more_than(self.config.ping_wait_time) {
                 continue;
             }
             if let Err(err) = conn.sink().send_relay_message(NetRelayMessageRelay::Ping, false).await {
@@ -370,7 +370,7 @@ impl PeerRelay {
             }
             
             //Check timeout
-            if conn.has_contact_timeout() {
+            if conn.stream().has_contact_timeout() {
                 log::info!("{:} peer {:} took too long to contact", self_str, conn);
                 conn.close(917347483);
                 continue
@@ -379,7 +379,9 @@ impl PeerRelay {
             //Poll peers sent messages
             for msg in {
                 match conn.stream_mut().try_read_messages(self.config.msgs_per_poll) {
-                    NetConnectionRead::Empty => Vec::new(),
+                    NetConnectionRead::Empty => {
+                        Vec::new()
+                    },
                     NetConnectionRead::Data(msgs) => msgs,
                     NetConnectionRead::Closed => {
                         continue
@@ -478,7 +480,6 @@ impl PeerRelay {
             }
             NetRelayMessagePeer::LeaveRoom => {
                 if let Some(mut conn) = self.peers.remove(&source_netid) {
-                    conn.update_last_contact();
                     conn.set_netid(NETID_NONE);
                     if let Err(err) = self.room_tx.send(PeerRelayMessage::StoreConnection(conn)).await {
                         log::error!("{:} Couldn't send StoreConnection message for LeaveRoom! {:?}", self, err);
@@ -493,7 +494,7 @@ impl PeerRelay {
             }
             NetRelayMessagePeer::PingResponse(ping) => {
                 if let Some(conn) = self.peers.get_mut(&source_netid) {
-                    conn.update_last_contact();
+                    conn.stream_mut().update_last_contact();
                     self.status.pings.insert(source_netid, ping.as_millis() as u32);
                 }
             }

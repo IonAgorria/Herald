@@ -1,15 +1,14 @@
 use std::{fmt, io};
+use std::fmt::{Debug, Formatter};
 use std::mem::size_of;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::Relaxed;
 use std::time::{Duration, Instant};
-use futures_util::{Sink, SinkExt, StreamExt};
-use futures_util::stream::BoxStream;
+use futures_util::{FutureExt, Sink, SinkExt, Stream, StreamExt};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::task::JoinHandle;
 use tokio_util::bytes::Bytes;
 use crate::relay::messages::NetRelayMessageRelay;
 use crate::utils::config_from_str;
@@ -23,9 +22,13 @@ pub const NETID_ALL: NETID = 3;
 /// Number is high to ensure games can allocate lower NETIDs for local use if required
 pub const NETID_CLIENTS_RELAY_START: NETID = 0x10000;
 
+pub enum StreamMessage {
+    Message(NetConnectionMessage)
+}
+
 type NetConnectionClosed = Arc<AtomicBool>;
-pub type NetConnectionMessageStream = BoxStream<'static, io::Result<NetConnectionMessage>>;
-pub type NetConnectionMessageSink = Pin<Box<dyn Sink<NetConnectionMessage, Error = io::Error> + Send + 'static>>;
+pub type NetConnectionMessageStream = Pin<Box<dyn Stream<Item = io::Result<StreamMessage>> + Send + Sync + 'static>>;
+pub type NetConnectionMessageSink = Pin<Box<dyn Sink<NetConnectionMessage, Error = io::Error> + Send + Sync + 'static>>;
 
 #[derive(Debug)]
 pub struct NetConnectionMessage {
@@ -78,24 +81,33 @@ pub enum NetConnectionRead<T> {
     Data(T)
 }
 
-#[derive(Debug)]
 pub struct NetConnectionStream {
-    closed: NetConnectionClosed,
     info: String,
-    queue_rx: mpsc::Receiver<NetConnectionRead<NetConnectionMessage>>,
-    ///Task that will poll the stream and send over channel, will finish once stream or channel is closed
-    task: JoinHandle<()>,
+    stream: Option<NetConnectionMessageStream>,
+    last_contact: Instant,
+    timeout: Duration,
+    closed: NetConnectionClosed,
+}
+
+impl Debug for NetConnectionStream {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("NetConnectionStream")
+            .field(&self.info)
+            .field(&self.last_contact)
+            .field(&self.timeout)
+            .field(&self.closed)
+            .finish()
+    }
 }
 
 impl NetConnectionStream {
-    pub fn new(closed: NetConnectionClosed, buffer_size: usize, info: String, stream: NetConnectionMessageStream) -> Self {
-        let (queue_tx, queue_rx) = mpsc::channel(buffer_size);
-        let task = tokio::spawn(Self::task_entry(info.clone(), stream, queue_tx));
+    pub fn new(closed: NetConnectionClosed, info: String, stream: NetConnectionMessageStream) -> Self {
         Self {
+            stream: Some(stream),
+            last_contact: Instant::now(),
+            timeout: Duration::ZERO,
             closed,
             info,
-            queue_rx,
-            task
         }
     }
     
@@ -104,65 +116,49 @@ impl NetConnectionStream {
             log::debug!("{:} closing", self);
         }
         self.closed.store(true, Relaxed);
-        self.queue_rx.close();
-        self.task.abort();
+        self.stream.take();
     }
     
     pub fn is_closed(&self) -> bool {
         self.closed.load(Relaxed)
     }
     
-    async fn task_entry(
-        info: String,
-        mut stream: NetConnectionMessageStream,
-        queue_tx: mpsc::Sender<NetConnectionRead<NetConnectionMessage>>
-    ) {
-        loop {
-            let res = match stream.next().await {
-                Some(Ok(msg)) => NetConnectionRead::Data(msg),
-                None => {
-                    log::trace!("NetConnectionStream::task {:} got closed", info);
-                    break;
-                },
-                Some(Err(err)) => {
-                    log::error!("NetConnectionStream::task {:} got error: {}", info, err);
-                    break;
-                },
-            };
-            if let Err(err) = queue_tx.send(res).await {
-                log::trace!("NetConnectionStream::task {:} send error {:}", info, err);
-                break;
-            }
-        }
-        log::trace!("NetConnectionStream::task {:} task finished", info);
-    }
-
     pub async fn read_message(&mut self) -> NetConnectionRead<NetConnectionMessage> {
         if self.is_closed() {
             return NetConnectionRead::Closed;
         }
-        //Returns None if closed, so just do this
-        let res = self.queue_rx.recv().await
-            .unwrap_or(NetConnectionRead::Closed);
-        if let NetConnectionRead::Closed = res {
-            self.close();
+        let stream = match &mut self.stream {
+            None => {
+                //Uhh not marked closed but no stream??
+                log::error!("NetConnectionStream {:} got no stream but no closed", self.info);
+                self.close();
+                return NetConnectionRead::Closed;
+            }
+            Some(stream) => stream
+        };
+        match stream.next().await {
+            None => {
+                log::trace!("NetConnectionStream {:} got closed", self.info);
+                self.close();
+                NetConnectionRead::Closed
+            },
+            Some(Err(err)) => {
+                log::error!("NetConnectionStream {:} got error: {}", self.info, err);
+                self.close();
+                NetConnectionRead::Closed
+            },
+            Some(Ok(StreamMessage::Message(msg))) => {
+                NetConnectionRead::Data(msg)
+            },
         }
-        res
     }
 
     pub fn try_read_message(&mut self) -> NetConnectionRead<NetConnectionMessage> {
         if self.is_closed() {
             return NetConnectionRead::Closed;
         }
-        let res = match self.queue_rx.try_recv() {
-            Err(mpsc::error::TryRecvError::Empty) => NetConnectionRead::Empty,
-            Err(mpsc::error::TryRecvError::Disconnected) => NetConnectionRead::Closed,
-            Ok(msg) => msg,
-        };
-        if let NetConnectionRead::Closed = res {
-            self.close();
-        }
-        res
+        self.read_message().now_or_never()
+            .unwrap_or(NetConnectionRead::Empty)
     }
 
     pub fn try_read_messages(&mut self, max_msgs: usize) -> NetConnectionRead<Vec<NetConnectionMessage>> {
@@ -182,6 +178,23 @@ impl NetConnectionStream {
         }
         NetConnectionRead::Data(msgs)
     }
+
+    pub fn set_timeout(&mut self, timeout: Duration) {
+        self.timeout = timeout;
+    }
+
+    pub fn update_last_contact(&mut self) {
+        self.last_contact = Instant::now();
+    }
+
+    pub fn is_last_contact_more_than(&self, duration: Duration) -> bool {
+        self.last_contact.elapsed() > duration
+    }
+
+    pub fn has_contact_timeout(&self) -> bool {
+        !self.timeout.is_zero() && self.is_last_contact_more_than(self.timeout)
+    }
+
 }
 
 #[derive(Debug)]
@@ -336,8 +349,6 @@ impl NetConnectionSink {
 
 #[derive(Debug)]
 pub struct NetConnection {
-    last_contact: Instant,
-    timeout: Duration,
     sink: NetConnectionSink,
     stream: NetConnectionStream,
 }
@@ -345,8 +356,6 @@ pub struct NetConnection {
 impl NetConnection {
     pub fn from_parts(sink: NetConnectionSink, stream: NetConnectionStream) -> Self {
         Self {
-            last_contact: Instant::now(),
-            timeout: Duration::ZERO,
             sink,
             stream,
         }
@@ -357,7 +366,7 @@ impl NetConnection {
         let closed = NetConnectionClosed::default();
         Self::from_parts(
             NetConnectionSink::new(closed.clone(), buffer_size, info.clone(), sink),
-            NetConnectionStream::new(closed, buffer_size, info, stream)
+            NetConnectionStream::new(closed, info, stream)
         )
     }
 
@@ -379,6 +388,10 @@ impl NetConnection {
         &self.sink
     }
 
+    pub fn stream(&self) -> &NetConnectionStream {
+        &self.stream
+    }
+
     pub fn stream_mut(&mut self) -> &mut NetConnectionStream {
         &mut self.stream
     }
@@ -391,22 +404,6 @@ impl NetConnection {
         self.stream.is_closed() || self.sink.is_closed()
     }
     
-    pub fn set_timeout(&mut self, timeout: Duration) {
-        self.timeout = timeout;
-    }
-    
-    pub fn update_last_contact(&mut self) {
-        self.last_contact = Instant::now();
-    }
-
-    pub fn is_last_contact_more_than(&self, duration: Duration) -> bool {
-        self.last_contact.elapsed() > duration
-    }
-
-    pub fn has_contact_timeout(&self) -> bool {
-        !self.timeout.is_zero() && self.is_last_contact_more_than(self.timeout)
-    }
-
     pub fn close(&mut self, code: u32) {
         if !self.is_closed() {
             log::debug!("{:} closing", self);
@@ -435,12 +432,12 @@ impl fmt::Display for NetConnection {
             write!(f, "NetConnection {{ NETID: {}, Sink: {}, Seen: {}ms }}",
                    self.sink.netid,
                    self.sink.info,
-                   self.last_contact.elapsed().as_millis(),
+                   self.stream.last_contact.elapsed().as_millis(),
             )            
         } else {
             write!(f, "NetConnection {{ NETID: {}, Seen: {}ms }}",
                    self.sink.netid,
-                   self.last_contact.elapsed().as_millis(),
+                   self.stream.last_contact.elapsed().as_millis(),
             )
         }
     }

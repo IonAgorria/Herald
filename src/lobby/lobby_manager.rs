@@ -8,7 +8,6 @@ use crate::AppData;
 use crate::lobby::room_info::{RoomInfo, RoomID};
 use crate::lobby::room::Room;
 use crate::netconnection::{NetConnection, NETID_HOST};
-use crate::relay::session_manager::SessionManagerSender;
 
 type RoomMap = HashMap<RoomID, Room>;
 pub type CurrentRoomInfos = ArcSwap<Vec<RoomInfo>>;
@@ -38,17 +37,14 @@ pub struct LobbyManager {
     rooms: RoomMap,
     ///App data
     app_data: Arc<AppData>,
-    ///Session manager
-    session_manager: SessionManagerSender,
 }
 
 impl LobbyManager {
-    pub fn new(app_data: Arc<AppData>, session_manager: SessionManagerSender) -> Self {
+    pub fn new(app_data: Arc<AppData>) -> Self {
         Self {
             room_next_id: AtomicU64::new(1),
             rooms: Default::default(),
             app_data,
-            session_manager,
         }
     }
     
@@ -108,9 +104,10 @@ impl LobbyManager {
         log::info!("{:} creating new room {:}", conn, info);
 
         //Create and insert room
+        let session_manager = self.app_data.session_manager.clone();
         let room = match topology {
-            1 => Room::new_server_client(conn, info, self.session_manager.clone()),
-            2 => Room::new_peer_to_peer(conn, info, self.session_manager.clone()),
+            1 => Room::new_server_client(conn, info, session_manager),
+            2 => Room::new_peer_to_peer(conn, info, session_manager),
             _ => {
                 //Not supposed to get here since we check topology before
                 log::error!("Unknown topology {:} for room {:}", topology, info);

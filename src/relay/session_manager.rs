@@ -2,8 +2,6 @@ use Default;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use std::time::{Duration, SystemTime};
-use tokio::sync::mpsc::error::SendError;
-use tokio::task::JoinHandle;
 use tokio::time::interval;
 use crate::AppData;
 use crate::lobby::lobby_manager::LobbyManager;
@@ -21,18 +19,26 @@ enum SessionManagerMessage {
 
 #[derive(Clone)]
 pub struct SessionManagerSender(mpsc::Sender<SessionManagerMessage>);
+pub struct SessionManagerReceiver(mpsc::Receiver<SessionManagerMessage>);
+
+impl SessionManagerSender {
+    pub fn new() -> (SessionManagerSender, SessionManagerReceiver) {
+        let channel_size = config_from_str::<usize>("SERVER_SESSION_MANAGER_MESSAGES_MAX", 1000);
+        let (session_manager_queue_tx, session_manager_queue_rx) = mpsc::channel(channel_size);
+        (
+            SessionManagerSender(session_manager_queue_tx),
+            SessionManagerReceiver(session_manager_queue_rx),
+        )
+    }
+}
 
 ///Handles the initial handshake and other game-relay interactions
 ///such as creating or joining rooms, etc
-pub struct SessionManager {
-    pub task: JoinHandle<()>,
-    pub queue_tx: SessionManagerSender,
-}
+pub struct SessionManager;
 
 struct SessionManagerState {
     running: bool,
     poll_interval: u64,
-    queue_tx: SessionManagerSender,
     queue_rx: mpsc::Receiver<SessionManagerMessage>,
     peers: Box<Vec<NetConnection>>,
     lobby_manager: LobbyManager,
@@ -40,33 +46,23 @@ struct SessionManagerState {
 }
 
 impl SessionManager {
-    pub fn init(app_data: Arc<AppData>) -> Self {
+    pub fn init(queue_rx: SessionManagerReceiver, app_data: Arc<AppData>) {
         let poll_interval = config_from_str::<u64>("SERVER_SESSION_MANAGER_POLL_INTERVAL", 10);
-        let channel_size = config_from_str::<usize>("SERVER_SESSION_MANAGER_MESSAGES_MAX", 1000);
-        let (queue_tx, queue_rx) = mpsc::channel(channel_size);
-        let session_manager_sender = SessionManagerSender(queue_tx.clone());
         let state = SessionManagerState {
             running: true,
             poll_interval,
-            queue_tx: session_manager_sender.clone(),
-            queue_rx,
+            queue_rx: queue_rx.0,
             peers: Default::default(),
-            lobby_manager: LobbyManager::new(app_data.clone(), session_manager_sender),
+            lobby_manager: LobbyManager::new(app_data.clone()),
             app_data,
         };
         
-        // Spawn thread and return struct
-        let task = tokio::spawn(state.entry());
-        
-        Self {
-            queue_tx: SessionManagerSender(queue_tx),
-            task,
-        }
+        tokio::spawn(state.entry());
     }
 }
 
 impl SessionManagerSender {
-    async fn send(&self, msg: SessionManagerMessage) -> Result<(), SendError<SessionManagerMessage>> {
+    async fn send(&self, msg: SessionManagerMessage) -> Result<(), mpsc::error::SendError<SessionManagerMessage>> {
         self.0.send(msg).await
     }
     
@@ -149,7 +145,7 @@ impl SessionManagerState {
             },
             SessionManagerMessage::ReplyConnection(conn, msg) => {
                 tokio::spawn(Self::process_connection_reply(
-                    conn, msg, self.queue_tx.clone(), self.app_data.clone()
+                    conn, msg, self.app_data.clone()
                 ));
             }
         }
@@ -159,9 +155,9 @@ impl SessionManagerState {
         //We take all peers currently available and send them to tasks for processing, then collect back
         let peers = std::mem::replace(&mut self.peers, Box::new(Vec::new()));
 
+        let queue_tx = self.app_data.session_manager.clone();
         for conn in peers.into_iter() {
-            let queue_tx = self.queue_tx.clone();
-            tokio::spawn(Self::process_peer_connection(conn, queue_tx));
+            tokio::spawn(Self::process_peer_connection(conn, queue_tx.clone()));
         }
     }
 
@@ -193,7 +189,7 @@ impl SessionManagerState {
         };
         
         //Check if peer took too much time to answer
-        if conn.has_contact_timeout() {
+        if conn.stream().has_contact_timeout() {
             //We just close and drop it here, no point going further to be discarded anyway
             log::info!("Peer {:} took too long to contact", conn);
             return; //Conn dropped here
@@ -224,8 +220,7 @@ impl SessionManagerState {
         }
     }
     
-    async fn process_connection_reply(mut conn: NetConnection, msg_peer: NetRelayMessagePeer,
-                                      queue_tx: SessionManagerSender, app_data: Arc<AppData>) {
+    async fn process_connection_reply(mut conn: NetConnection, msg_peer: NetRelayMessagePeer, app_data: Arc<AppData>) {
         //First assemble the relay reply
         let msg = match msg_peer {
             NetRelayMessagePeer::ListLobbies { game_type, format } => {
@@ -255,8 +250,8 @@ impl SessionManagerState {
             return; //Conn dropped here
         }
 
-        conn.update_last_contact();
-        if let Err(err) = queue_tx.send(
+        conn.stream_mut().update_last_contact();
+        if let Err(err) = app_data.session_manager.send(
             SessionManagerMessage::StoreConnection(conn)
         ).await {
             log::error!("Couldn't send processed connection to queue! {:?}", err);
