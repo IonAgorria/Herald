@@ -23,6 +23,7 @@ pub const NETID_ALL: NETID = 3;
 pub const NETID_CLIENTS_RELAY_START: NETID = 0x10000;
 
 pub enum StreamMessage {
+    PingResponse,
     Message(NetConnectionMessage)
 }
 
@@ -147,6 +148,10 @@ impl NetConnectionStream {
                 self.close();
                 NetConnectionRead::Closed
             },
+            Some(Ok(StreamMessage::PingResponse)) => {
+                self.update_last_contact();
+                NetConnectionRead::Empty
+            }
             Some(Ok(StreamMessage::Message(msg))) => {
                 NetConnectionRead::Data(msg)
             },

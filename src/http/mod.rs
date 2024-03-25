@@ -5,6 +5,7 @@ use middleware::key_token::KeyTokens;
 mod middleware;
 pub mod utils;
 mod lobby;
+mod ws;
 
 pub fn scope() -> actix_web::Scope {
     web::scope("/api")
@@ -17,6 +18,7 @@ pub fn configure(svc: &mut ServiceConfig) {
     svc.service(scope().wrap(KeyTokens::new(vec![
         dotenvy::var("SERVER_TOKEN").unwrap_or_default(),
     ])));
+    svc.service(ws::service);
 }
 
 #[get("/test")]

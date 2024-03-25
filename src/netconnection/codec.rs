@@ -193,14 +193,10 @@ impl NetConnectionCodecEncoder {
     pub fn new_framed<T: AsyncWrite>(inner: T) -> codec::FramedWrite<T, Self> {
         codec::FramedWrite::new(inner, Self::new())
     }
-}
 
-impl Encoder<NetConnectionMessage> for NetConnectionCodecEncoder {
-    type Error = io::Error;
-
-    fn encode(&mut self, item: NetConnectionMessage, dst: &mut BytesMut) -> Result<(), io::Error> {
+    pub fn encode_message(msg: NetConnectionMessage, dst: &mut BytesMut) -> Result<(), io::Error> {
         //Add header
-        let (header, total_len) = item.generate_header()
+        let (header, total_len) = msg.generate_header()
             .map_err(|len| io::Error::new(
                 io::ErrorKind::InvalidInput,
                 NetConnectionCodecError::WrongLength(len),
@@ -209,18 +205,26 @@ impl Encoder<NetConnectionMessage> for NetConnectionCodecEncoder {
         // Reserve capacity in the destination buffer to fit the frame and
         // length field (plus adjustment).
         dst.reserve(total_len);
-        
+
         //Set header
         dst.put_u64(header);
-        
+
         //Add source and destination NETID
-        dst.put_u64(item.source_netid);
-        dst.put_u64(item.destination_netid);
+        dst.put_u64(msg.source_netid);
+        dst.put_u64(msg.destination_netid);
 
         // Write the frame to the buffer
-        dst.extend_from_slice(&item.data[..]);
+        dst.extend_from_slice(&msg.data[..]);
 
         Ok(())
+    }
+}
+
+impl Encoder<NetConnectionMessage> for NetConnectionCodecEncoder {
+    type Error = io::Error;
+
+    fn encode(&mut self, item: NetConnectionMessage, dst: &mut BytesMut) -> Result<(), io::Error> {
+        Self::encode_message(item, dst)
     }
 }
 
