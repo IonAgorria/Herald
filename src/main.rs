@@ -105,23 +105,27 @@ pub async fn tcp_listener(session_manager: SessionManagerSender) -> Result<(), i
         loop {
             match listener.accept().await {
                 Ok((stream, addr)) =>  {
-                    log::info!("TCP Incoming connection {:}", addr);
-                    if let Err(err) = stream.set_nodelay(true) {
-                        log::error!("TCP {:} error setting nodelay: {:}", addr, err);
-                    }
-                    if let Err(err) = stream.set_linger(Some(Duration::from_secs(tcp_linger))) {
-                        log::error!("TCP {:} error setting linger: {:}", addr, err);
-                    }
-                    let (read, write) = stream.into_split();
-                    let stream = codec::NetConnectionCodecDecoder::new_framed(read)
-                        .map_ok(|msg| StreamMessage::Message(msg));
-                    let mut connection = NetConnection::from_streams(
-                        format!("TCP({})", addr),
-                        Box::pin(codec::NetConnectionCodecEncoder::new_framed(write)),
-                        Box::pin(stream)
-                    );
-                    connection.stream_mut().set_timeout(Duration::from_millis(tcp_timeout));
-                    session_manager.incoming_connection(connection).await;
+                    //Handle connection on a new task to avoid blocking the socket acceptor task
+                    let session_manager_task = session_manager.clone();
+                    tokio::spawn(async move {
+                        log::info!("Incoming TCP connection: {:}", addr);
+                        if let Err(err) = stream.set_nodelay(true) {
+                            log::error!("TCP {:} error setting nodelay: {:}", addr, err);
+                        }
+                        if let Err(err) = stream.set_linger(Some(Duration::from_secs(tcp_linger))) {
+                            log::error!("TCP {:} error setting linger: {:}", addr, err);
+                        }
+                        let (read, write) = stream.into_split();
+                        let stream = codec::NetConnectionCodecDecoder::new_framed(read)
+                            .map_ok(|msg| StreamMessage::Message(msg));
+                        let mut connection = NetConnection::from_streams(
+                            format!("TCP({})", addr),
+                            Box::pin(codec::NetConnectionCodecEncoder::new_framed(write)),
+                            Box::pin(stream)
+                        );
+                        connection.stream_mut().set_timeout(Duration::from_millis(tcp_timeout));
+                        session_manager_task.incoming_connection(connection).await;
+                    });
                 }
                 Err(err) => {
                     log::info!("TCP listener accept error: {:}", err);
@@ -142,7 +146,7 @@ async fn setup_app() -> std::io::Result<()> {
         .collect();
     let tcp_public_address = config_string("SERVER_TCP_PUBLIC_ADDRESS", "");
     if tcp_public_address.is_empty() {
-        return Err(std::io::Error::other("SERVER_TCP_PUBLIC_ADDRESS not configured!"));
+        return Err(io::Error::other("SERVER_TCP_PUBLIC_ADDRESS not configured!"));
     }
     let http_bind_address = config_string("SERVER_HTTP_BIND_ADDRESS", "0.0.0.0:8888");
     let http_public_address = config_string("SERVER_HTTP_PUBLIC_ADDRESS", http_bind_address.as_str());
