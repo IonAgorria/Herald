@@ -1,0 +1,15 @@
+version: '3.1'
+
+services:
+#  db:
+#    image: postgres:latest-alpine
+#    restart: no
+#    environment:
+#      - POSTGRES_DATABASE=database
+#      - POSTGRES_USER=user
+#      - POSTGRES_PASSWORD=toor
+#    ports:
+#      - "127.0.0.1:5432:5432"
+  app:
+    image: herald
+    build: ./
