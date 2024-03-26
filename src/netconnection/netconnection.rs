@@ -152,6 +152,19 @@ impl NetConnectionStream {
             },
         }
     }
+    
+    pub async fn read_message_or_timeout(&mut self, timeout: Duration) -> NetConnectionRead<NetConnectionMessage> {
+        let sleep = tokio::time::sleep(timeout);
+        tokio::pin!(sleep);
+        tokio::select! {
+            msg = self.read_message() => {
+                msg
+            }
+            _ = &mut sleep => {
+                NetConnectionRead::Empty
+            }
+        }
+    }
 
     pub fn try_read_message(&mut self) -> NetConnectionRead<NetConnectionMessage> {
         if self.is_closed() {

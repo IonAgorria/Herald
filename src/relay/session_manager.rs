@@ -38,7 +38,8 @@ pub struct SessionManager;
 
 struct SessionManagerState {
     running: bool,
-    poll_interval: u64,
+    poll_interval: Duration,
+    message_timeout: Duration,
     queue_rx: mpsc::Receiver<SessionManagerMessage>,
     peers: Box<Vec<NetConnection>>,
     lobby_manager: LobbyManager,
@@ -47,10 +48,10 @@ struct SessionManagerState {
 
 impl SessionManager {
     pub fn init(queue_rx: SessionManagerReceiver, app_data: Arc<AppData>) {
-        let poll_interval = config_from_str::<u64>("SERVER_SESSION_MANAGER_POLL_INTERVAL", 10);
         let state = SessionManagerState {
             running: true,
-            poll_interval,
+            poll_interval: Duration::from_millis(config_from_str::<u64>("SERVER_SESSION_MANAGER_POLL_INTERVAL", 10)),
+            message_timeout: Duration::from_millis(config_from_str::<u64>("SERVER_SESSION_MANAGER_MESSAGE_TIMEOUT", 1000)),
             queue_rx: queue_rx.0,
             peers: Default::default(),
             lobby_manager: LobbyManager::new(app_data.clone()),
@@ -86,7 +87,7 @@ impl SessionManagerSender {
 
 impl SessionManagerState {
     async fn entry(mut self) {
-        let mut interval = interval(Duration::from_millis(self.poll_interval));
+        let mut interval = interval(self.poll_interval);
         while self.running {
             self.lobby_manager.update().await;
             self.poll_peers().await;
@@ -154,15 +155,28 @@ impl SessionManagerState {
     async fn poll_peers(&mut self) {
         //We take all peers currently available and send them to tasks for processing, then collect back
         let peers = std::mem::replace(&mut self.peers, Box::new(Vec::new()));
-
+        
         let queue_tx = self.app_data.session_manager.clone();
         for conn in peers.into_iter() {
-            tokio::spawn(Self::process_peer_connection(conn, queue_tx.clone()));
+            tokio::spawn(Self::process_peer_connection(conn, queue_tx.clone(), self.message_timeout));
         }
     }
 
-    async fn process_peer_connection(mut conn: NetConnection, queue_tx: SessionManagerSender) {
-        let message = match conn.stream_mut().read_message().await {
+    async fn process_peer_connection(
+        mut conn: NetConnection,
+        queue_tx: SessionManagerSender,
+        timeout: Duration
+    ) {
+        log::trace!("Peer {:} process_peer_connection", conn);
+        //Check if peer took too much time to answer
+        if conn.stream().has_contact_timeout() {
+            //We just close and drop it here, no point going further to be discarded anyway
+            log::info!("Peer {:} took too long to contact", conn);
+            return; //Conn dropped here
+        }
+
+        //Read for a message or timeout
+        let message = match conn.stream_mut().read_message_or_timeout(timeout).await {
             NetConnectionRead::Closed => {
                 //Nothing to do here since is closed
                 return;
@@ -187,13 +201,6 @@ impl SessionManagerState {
                 }
             },
         };
-        
-        //Check if peer took too much time to answer
-        if conn.stream().has_contact_timeout() {
-            //We just close and drop it here, no point going further to be discarded anyway
-            log::info!("Peer {:} took too long to contact", conn);
-            return; //Conn dropped here
-        }
 
         let queue_message = match message {
             NetRelayMessagePeer::Close(code) => {
