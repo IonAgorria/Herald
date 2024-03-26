@@ -5,8 +5,7 @@ use std::time::Duration;
 use actix_http::ws;
 use actix_http::ws::{Frame, HandshakeError, Message, ProtocolError};
 use actix_web::{
-    web, get,
-    HttpRequest, HttpResponse, HttpResponseBuilder
+    web, HttpRequest, HttpResponse, HttpResponseBuilder
 };
 use actix_web::http::{header, Method, StatusCode};
 use actix_web::http::header::HeaderValue;
@@ -24,8 +23,7 @@ use crate::netconnection::codec::{NetConnectionCodecDecoder, NetConnectionCodecE
 use crate::netconnection::{NetConnection, NetConnectionMessage, StreamMessage};
 use crate::utils::config_from_str;
 
-#[get("/ws")]
-async fn service(req: HttpRequest, payload: web::Payload, app_data: web::Data<AppData>) -> Result<HttpResponse, actix_web::Error> {
+pub async fn handler(req: HttpRequest, payload: web::Payload, app_data: web::Data<AppData>) -> Result<HttpResponse, actix_web::Error> {
     let mut res = handshake_with_protocols(&req, &[])?;
     let info = if let Some(addr) = req.peer_addr() {
         log::info!("Incoming WebSocket connection: {:}", addr);
@@ -79,13 +77,14 @@ async fn service(req: HttpRequest, payload: web::Payload, app_data: web::Data<Ap
         //Spin websocket ping task
         let ping_interval = Duration::from_millis(config_from_str::<u64>("SERVER_WS_PING_INTERVAL", 5000));
         tokio::spawn(task_sink_ping(
-            info.clone(), cancellation,
+            info.clone(), cancellation.clone(),
             ping_interval, ws_sink_tx
         ));
         
         //Create connection with both sink and stream
         let mut connection = NetConnection::from_streams(
             info,
+            cancellation,
             Box::pin(ws_sink),
             Box::pin(ReceiverStream::new(msg_stream_rx))
         );

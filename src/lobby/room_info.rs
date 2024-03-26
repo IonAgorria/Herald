@@ -6,9 +6,14 @@ use validator::{Validate, ValidationError};
 pub type RoomID = u64;
 
 #[derive(Debug, Clone, Serialize)]
-pub struct LobbyWithRooms {
+pub struct LobbyHost {
     pub host_tcp: String,
     pub host_ws: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LobbyWithRooms {
+    pub host: LobbyHost,
     pub rooms: Vec<RoomInfo>,
 }
 

@@ -158,11 +158,11 @@ impl SessionManagerState {
         
         let queue_tx = self.app_data.session_manager.clone();
         for conn in peers.into_iter() {
-            tokio::spawn(Self::process_peer_connection(conn, queue_tx.clone(), self.message_timeout));
+            tokio::spawn(Self::task_process_peer_connection(conn, queue_tx.clone(), self.message_timeout));
         }
     }
 
-    async fn process_peer_connection(
+    async fn task_process_peer_connection(
         mut conn: NetConnection,
         queue_tx: SessionManagerSender,
         timeout: Duration
@@ -207,6 +207,7 @@ impl SessionManagerState {
                 log::debug!("Connection {:} got close message code {:}", conn, code);
                 return; //Conn dropped here
             }
+            NetRelayMessagePeer::ListLobbyHosts {..} |
             NetRelayMessagePeer::ListLobbies {..} => {
                 //Reply with the rooms, we need access to rooms list
                 SessionManagerMessage::ReplyConnection(conn, message)
@@ -230,17 +231,25 @@ impl SessionManagerState {
     async fn process_connection_reply(mut conn: NetConnection, msg_peer: NetRelayMessagePeer, app_data: Arc<AppData>) {
         //First assemble the relay reply
         let msg = match msg_peer {
-            NetRelayMessagePeer::ListLobbies { game_type, format } => {
+            NetRelayMessagePeer::ListLobbies { game_type, format, .. } => {
                 let room_infos_guard = app_data.room_infos.load();
                 let lobbies = vec![
                     LobbyWithRooms {
-                        host_tcp: app_data.tcp_public_address.clone(),
-                        host_ws: app_data.ws_public_address.clone(),
+                        host: app_data.lobby_host.clone(),
                         rooms: LobbyManager::filter_room_by_game_type(&room_infos_guard, &game_type),
                     }
                 ];
                 NetRelayMessageRelay::ListLobbies {
-                    lobbies, 
+                    lobbies,
+                    format,
+                }
+            },
+            NetRelayMessagePeer::ListLobbyHosts { format, .. } => {
+                let hosts = vec![
+                    app_data.lobby_host.clone(),
+                ];
+                NetRelayMessageRelay::ListLobbyHosts {
+                    hosts,
                     format,
                 }
             },

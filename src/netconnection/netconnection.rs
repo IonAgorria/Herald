@@ -1,15 +1,13 @@
 use std::{fmt, io};
-use std::fmt::{Debug, Formatter};
+use std::fmt::Debug;
 use std::mem::size_of;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering::Relaxed;
 use std::time::{Duration, Instant};
 use futures_util::{FutureExt, Sink, SinkExt, Stream, StreamExt};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio_util::bytes::Bytes;
+use tokio_util::sync::CancellationToken;
 use crate::relay::messages::NetRelayMessageRelay;
 use crate::utils::config_from_str;
 
@@ -27,7 +25,6 @@ pub enum StreamMessage {
     Message(NetConnectionMessage)
 }
 
-type NetConnectionClosed = Arc<AtomicBool>;
 pub type NetConnectionMessageStream = Pin<Box<dyn Stream<Item = io::Result<StreamMessage>> + Send + Sync + 'static>>;
 pub type NetConnectionMessageSink = Pin<Box<dyn Sink<NetConnectionMessage, Error = io::Error> + Send + Sync + 'static>>;
 
@@ -84,14 +81,14 @@ pub enum NetConnectionRead<T> {
 
 pub struct NetConnectionStream {
     info: String,
-    stream: Option<NetConnectionMessageStream>,
+    stream: NetConnectionMessageStream,
     last_contact: Instant,
     timeout: Duration,
-    closed: NetConnectionClosed,
+    closed: CancellationToken,
 }
 
 impl Debug for NetConnectionStream {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("NetConnectionStream")
             .field(&self.info)
             .field(&self.last_contact)
@@ -102,9 +99,9 @@ impl Debug for NetConnectionStream {
 }
 
 impl NetConnectionStream {
-    pub fn new(closed: NetConnectionClosed, info: String, stream: NetConnectionMessageStream) -> Self {
+    pub fn new(closed: CancellationToken, info: String, stream: NetConnectionMessageStream) -> Self {
         Self {
-            stream: Some(stream),
+            stream,
             last_contact: Instant::now(),
             timeout: Duration::ZERO,
             closed,
@@ -116,28 +113,21 @@ impl NetConnectionStream {
         if !self.is_closed() {
             log::debug!("{:} closing", self);
         }
-        self.closed.store(true, Relaxed);
-        self.stream.take();
+        self.closed.cancel();
     }
     
     pub fn is_closed(&self) -> bool {
-        self.closed.load(Relaxed)
+        self.closed.is_cancelled()
     }
     
     pub async fn read_message(&mut self) -> NetConnectionRead<NetConnectionMessage> {
         if self.is_closed() {
             return NetConnectionRead::Closed;
         }
-        let stream = match &mut self.stream {
-            None => {
-                //Uhh not marked closed but no stream??
-                log::error!("NetConnectionStream {:} got no stream but no closed", self.info);
-                self.close();
-                return NetConnectionRead::Closed;
-            }
-            Some(stream) => stream
-        };
-        match stream.next().await {
+        match tokio::select! {
+            res = self.stream.next() => { res },
+            _ = self.closed.cancelled() => { None }
+        } {
             None => {
                 log::trace!("NetConnectionStream {:} got closed", self.info);
                 self.close();
@@ -232,14 +222,14 @@ pub enum NetConnectionWrite {
 #[derive(Debug, Clone)]
 pub struct NetConnectionSink {
     ///Flag to know connection stream is closed, we do not set it from sink as we may have several copies
-    closed: NetConnectionClosed,
+    closed: CancellationToken,
     info: String,
     netid: NETID,
     queue_tx: mpsc::Sender<NetConnectionSinkMessage>,
 }
 
 impl NetConnectionSink {
-    pub fn new(closed: NetConnectionClosed, buffer_size: usize, info: String, sink: NetConnectionMessageSink) -> Self {
+    pub fn new(closed: CancellationToken, buffer_size: usize, info: String, sink: NetConnectionMessageSink) -> Self {
         let (queue_tx, queue_rx) = mpsc::channel(buffer_size);
         //Task that will poll the channel and send over sink, will finish once sink or channel is closed
         tokio::spawn(Self::task_entry(info.clone(), sink, queue_rx, closed.clone()));
@@ -255,10 +245,11 @@ impl NetConnectionSink {
         info: String,
         mut sink: NetConnectionMessageSink,
         mut queue_rx: mpsc::Receiver<NetConnectionSinkMessage>,
-        closed: NetConnectionClosed
+        closed: CancellationToken
     ) {
         let mut close_code = 0;
         //Keep going until None is returned which means is closed + no more msgs in queue
+        //We don't want to check closed state yet as we may have some pending messages left
         while let Some(action) = queue_rx.recv().await {
             if let Err(err) = match action {
                 NetConnectionSinkMessage::CloseCode(code) => {
@@ -278,6 +269,7 @@ impl NetConnectionSink {
                 },
             } {
                 log::error!("NetConnectionSink::task action error {:?}", err);
+                break;
             }
         }
         //Send close message, close sink and set flag
@@ -294,12 +286,12 @@ impl NetConnectionSink {
         }
         let _ = sink.flush().await;
         let _ = sink.close().await;
-        closed.store(true, Relaxed);
         log::trace!("NetConnectionSink::task {:} finished", info);
+        closed.cancel();
     }
 
     pub fn is_closed(&self) -> bool {
-        self.closed.load(Relaxed)
+        self.closed.is_cancelled()
     }
 
     pub fn get_netid(&self) -> NETID {
@@ -379,9 +371,8 @@ impl NetConnection {
         }
     }
 
-    pub fn from_streams(info: String, sink: NetConnectionMessageSink, stream: NetConnectionMessageStream) -> Self {
+    pub fn from_streams(info: String, closed: CancellationToken, sink: NetConnectionMessageSink, stream: NetConnectionMessageStream) -> Self {
         let buffer_size = config_from_str::<usize>("SERVER_CONNECTION_BUFFER_SIZE", 50);
-        let closed = NetConnectionClosed::default();
         Self::from_parts(
             NetConnectionSink::new(closed.clone(), buffer_size, info.clone(), sink),
             NetConnectionStream::new(closed, info, stream)

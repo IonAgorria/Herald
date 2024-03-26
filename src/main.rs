@@ -21,18 +21,14 @@ use actix_web::http::KeepAlive;
 use actix_web::middleware::Logger;
 use actix_web::web::Data;
 use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
+use crate::lobby::room_info::LobbyHost;
 use crate::netconnection::{codec, NetConnection, StreamMessage};
 use crate::relay::session_manager::{SessionManager, SessionManagerSender};
 use crate::utils::{config_from_str, config_string};
 
-#[actix_web::get("/")]
-async fn root() -> impl actix_web::Responder {
-    http::utils::http_ok_utf8("🦀")
-}
-
 pub struct AppData {
-    tcp_public_address: String,
-    ws_public_address: String,
+    lobby_host: LobbyHost,
     allowed_games_types: Vec<String>,
     room_infos: lobby::lobby_manager::CurrentRoomInfos,
     session_manager: SessionManagerSender,
@@ -56,7 +52,6 @@ fn run_http_server(http_bind_address: String, appdata: Arc<AppData>) -> std::io:
                     App::new()
                         .app_data(Data::from(appdata.clone()))
                         .configure(http::configure)
-                        .service(root)
                         .wrap(Logger::new(logger_format.as_str()))
                         .wrap(actix_cors::Cors::permissive())
                 });
@@ -120,6 +115,7 @@ pub async fn tcp_listener(session_manager: SessionManagerSender) -> Result<(), i
                             .map_ok(|msg| StreamMessage::Message(msg));
                         let mut connection = NetConnection::from_streams(
                             format!("TCP({})", addr),
+                            CancellationToken::new(),
                             Box::pin(codec::NetConnectionCodecEncoder::new_framed(write)),
                             Box::pin(stream)
                         );
@@ -144,19 +140,27 @@ async fn setup_app() -> std::io::Result<()> {
         .split(",")
         .filter_map(|v| if v.is_empty() { None } else { Some(String::from(v)) })
         .collect();
-    let tcp_public_address = config_string("SERVER_TCP_PUBLIC_ADDRESS", "");
-    if tcp_public_address.is_empty() {
-        return Err(io::Error::other("SERVER_TCP_PUBLIC_ADDRESS not configured!"));
+    let tcp_public_address = config_string("SERVER_TCP_PUBLIC_ADDRESS", "127.0.0.1:11654");
+    let http_bind_address = config_string("SERVER_HTTP_BIND_ADDRESS", "127.0.0.1:8888");
+    let mut http_public_address = config_string("SERVER_HTTP_PUBLIC_ADDRESS", http_bind_address.as_str());
+    if !http_public_address.starts_with("http") && !http_public_address.contains("://") {
+        http_public_address = "http://".to_string() + http_public_address.as_str();
     }
-    let http_bind_address = config_string("SERVER_HTTP_BIND_ADDRESS", "0.0.0.0:8888");
-    let http_public_address = config_string("SERVER_HTTP_PUBLIC_ADDRESS", http_bind_address.as_str());
-    log::info!("Public relay address:\n\tHTTP = {}\n\tTCP = {}", http_public_address, tcp_public_address);
+    let ws_public_address = config_string("SERVER_WS_PUBLIC_ADDRESS", (http_public_address.replace("http", "ws")).as_str());
+    log::info!(
+        "Public relay address:\n\tHTTP = {}\n\tWS = {}\n\tTCP = {}",
+        http_public_address,
+        ws_public_address,
+        tcp_public_address
+    );
         
     //Create shared app state for request handlers
     let (session_manager_queue_tx, session_manager_queue_rx) = SessionManagerSender::new();
     let app_data = Arc::new(AppData {
-        tcp_public_address,
-        ws_public_address: http_public_address + "/ws",
+        lobby_host: LobbyHost {
+            host_tcp: tcp_public_address,
+            host_ws: ws_public_address,
+        },
         allowed_games_types,
         room_infos: Default::default(),
         session_manager: session_manager_queue_tx,

@@ -505,6 +505,7 @@ impl PeerRelay {
                     };
                 }
             }
+            NetRelayMessagePeer::ListLobbyHosts { .. } |
             NetRelayMessagePeer::ListLobbies { .. } |
             NetRelayMessagePeer::JoinRoom(_) => {
                 log::debug!("{:} unknown relay message: {:?}", self, peer_msg);

@@ -8,7 +8,7 @@ use num_traits::FromPrimitive;
 use tokio_util::bytes::{Buf, BufMut, Bytes};
 use serde::{Serialize};
 use crate::lobby::lobby_manager::RoomJoinInfo;
-use crate::lobby::room_info::{LobbyWithRooms, RoomInfo};
+use crate::lobby::room_info::{LobbyHost, LobbyWithRooms, RoomInfo};
 use crate::netconnection::{NETID, NETID_ALL, NETID_HOST, NETID_NONE, NETID_RELAY};
 use crate::netconnection::NetConnectionMessage;
 use crate::utils::time::{duration_since_timestamp, get_timestamp};
@@ -34,6 +34,7 @@ pub enum NetRelayMessageType {
     RELAY_MSG_PEER_LEAVE_ROOM,
     RELAY_MSG_PEER_PING_RESPONSE,
     RELAY_MSG_PEER_CLOSE_PEER,
+    RELAY_MSG_PEER_LIST_LOBBY_HOSTS,
 
     //Sent by relay to peer
     RELAY_MSG_RELAY_START = 0x20000,
@@ -42,6 +43,7 @@ pub enum NetRelayMessageType {
     RELAY_MSG_RELAY_LIST_PEERS,
     RELAY_MSG_RELAY_ADD_PEER,
     RELAY_MSG_RELAY_REMOVE_PEER,
+    RELAY_MSG_RELAY_LIST_LOBBY_HOSTS,
 }
 
 #[derive(Debug, Serialize)]
@@ -62,8 +64,14 @@ pub enum NetRelayMessageError {
 pub enum NetRelayMessagePeer {
     Close(u32),
     PingResponse(Duration),
+    ListLobbyHosts {
+        game_type: String,
+        game_version: String,
+        format: u16,
+    },
     ListLobbies {
         game_type: String,
+        game_version: String,
         format: u16,
     },
     SetupRoom {
@@ -80,6 +88,10 @@ pub enum NetRelayMessagePeer {
 pub enum NetRelayMessageRelay {
     Close(u32),
     Ping,
+    ListLobbyHosts {
+        hosts: Vec<LobbyHost>,
+        format: u16
+    },
     ListLobbies {
         lobbies: Vec<LobbyWithRooms>,
         format: u16
@@ -160,12 +172,24 @@ impl NetRelayMessagePeer {
                 NetRelayMessagePeer::Close(code)
             },
             NetRelayMessageType::RELAY_MSG_PEER_LEAVE_ROOM => NetRelayMessagePeer::LeaveRoom,
+            NetRelayMessageType::RELAY_MSG_PEER_LIST_LOBBY_HOSTS => {
+                let game_type = Self::read_string(data, 32)?;
+                let game_version = Self::read_string(data, 32)?;
+                let format = data.get_u16_le();
+                NetRelayMessagePeer::ListLobbyHosts {
+                    game_type,
+                    game_version,
+                    format
+                }
+            },
             NetRelayMessageType::RELAY_MSG_PEER_LIST_LOBBIES => {
                 let game_type = Self::read_string(data, 32)?;
+                let game_version = Self::read_string(data, 32)?;
                 let format = data.get_u16_le();
-                NetRelayMessagePeer::ListLobbies { 
+                NetRelayMessagePeer::ListLobbies {
                     game_type,
-                    format 
+                    game_version,
+                    format
                 }
             },
             NetRelayMessageType::RELAY_MSG_PEER_SETUP_ROOM => {
@@ -224,6 +248,7 @@ impl NetRelayMessagePeer {
             NetRelayMessageType::RELAY_MSG_RELAY_LIST_PEERS |
             NetRelayMessageType::RELAY_MSG_RELAY_ADD_PEER |
             NetRelayMessageType::RELAY_MSG_RELAY_REMOVE_PEER |
+            NetRelayMessageType::RELAY_MSG_RELAY_LIST_LOBBY_HOSTS |
             NetRelayMessageType::RELAY_MSG_UNKNOWN => {
                 return Err(NetRelayMessageError::UnknownType(head));
             }
@@ -263,6 +288,13 @@ impl NetRelayMessageRelay {
                 let stamp = get_timestamp();
                 buf.put_u64_le(stamp.0);
                 buf.put_u32_le(stamp.1);
+            },
+            NetRelayMessageRelay::ListLobbyHosts { hosts, format } => {
+                Self::write_header(&mut buf, NetRelayMessageType::RELAY_MSG_RELAY_LIST_LOBBY_HOSTS);
+                let xprm = format == 1;
+                let result = serialize_xprm_or_json(xprm, &hosts)
+                    .map_err(|err| io::Error::other(err))?;
+                buf.put_slice(result.as_bytes());
             },
             NetRelayMessageRelay::ListLobbies { lobbies, format } => {
                 Self::write_header(&mut buf, NetRelayMessageType::RELAY_MSG_RELAY_LIST_LOBBIES);
