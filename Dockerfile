@@ -24,16 +24,16 @@ RUN cargo install --path .
 #Add binaries to runtime stage
 FROM runtime
 
-RUN mkdir /data
-WORKDIR /data
-
 #Copy runtime stuff
 COPY --from=builder /usr/local/cargo/bin/herald /usr/local/bin/herald
-COPY docker_entry.sh/ ./
+COPY docker_entry.sh/ /usr/src/app/
 
 #Setup user
 RUN groupadd -f -g 999 user
 RUN useradd -r -m -d /home/user -s /bin/bin/nologin -u 999 -g user user
+
+RUN mkdir /data
+WORKDIR /data
 
 ENTRYPOINT ["/usr/src/app/docker_entry.sh"]
 CMD ["herald"]

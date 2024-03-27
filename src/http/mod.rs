@@ -10,7 +10,7 @@ mod ws;
 pub fn configure(svc: &mut ServiceConfig) {
     //API scope
     svc.service(api_scope().wrap(middleware::key_token::KeyTokens::new(vec![
-        dotenvy::var("SERVER_TOKEN").unwrap_or_default(),
+        dotenvy::var("SERVER_HTTP_TOKEN").unwrap_or_default(),
     ])));
     //WebService endpoint
     svc.service(

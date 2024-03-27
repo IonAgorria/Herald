@@ -13,3 +13,4 @@ services:
   app:
     image: herald
     build: ./
+    restart: no
