@@ -202,6 +202,7 @@ impl SessionManagerState {
             },
         };
 
+        conn.stream_mut().update_last_contact();
         let queue_message = match message {
             NetRelayMessagePeer::Close(code) => {
                 log::debug!("Connection {:} got close message code {:}", conn, code);
@@ -223,7 +224,6 @@ impl SessionManagerState {
             }
         };
 
-        conn.stream_mut().update_last_contact();
         if let Err(err) = queue_tx.send(queue_message).await {
             log::error!("Couldn't send processed connection to queue! {:?}", err);
         }
