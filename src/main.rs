@@ -141,7 +141,7 @@ async fn setup_app() -> std::io::Result<()> {
         .filter_map(|v| if v.is_empty() { None } else { Some(String::from(v)) })
         .collect();
     let tcp_public_address = config_string("SERVER_TCP_PUBLIC_ADDRESS", "127.0.0.1:11654");
-    let http_bind_address = config_string("SERVER_HTTP_BIND_ADDRESS", "127.0.0.1:8888");
+    let http_bind_address = config_string("SERVER_HTTP_BIND_ADDRESS", "0.0.0.0:8888");
     let mut http_public_address = config_string("SERVER_HTTP_PUBLIC_ADDRESS", http_bind_address.as_str());
     if !http_public_address.starts_with("http") && !http_public_address.contains("://") {
         http_public_address = "http://".to_string() + http_public_address.as_str();
