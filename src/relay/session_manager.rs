@@ -145,7 +145,7 @@ impl SessionManagerState {
                 }
             },
             SessionManagerMessage::ReplyConnection(conn, msg) => {
-                tokio::spawn(Self::process_connection_reply(
+                tokio::spawn(Self::task_process_connection_reply(
                     conn, msg, self.app_data.clone()
                 ));
             }
@@ -223,12 +223,13 @@ impl SessionManagerState {
             }
         };
 
+        conn.stream_mut().update_last_contact();
         if let Err(err) = queue_tx.send(queue_message).await {
             log::error!("Couldn't send processed connection to queue! {:?}", err);
         }
     }
     
-    async fn process_connection_reply(mut conn: NetConnection, msg_peer: NetRelayMessagePeer, app_data: Arc<AppData>) {
+    async fn task_process_connection_reply(mut conn: NetConnection, msg_peer: NetRelayMessagePeer, app_data: Arc<AppData>) {
         //First assemble the relay reply
         let msg = match msg_peer {
             NetRelayMessagePeer::ListLobbies { game_type, format, .. } => {
