@@ -8,6 +8,7 @@ mod netconnection;
 #[macro_use]
 mod macros;
 
+use std::fs::File;
 use std::io;
 use std::net::SocketAddr;
 use std::str::FromStr;
@@ -20,7 +21,7 @@ use actix_web::{App, HttpServer};
 use actix_web::http::KeepAlive;
 use actix_web::middleware::Logger;
 use actix_web::web::Data;
-use tokio::net::TcpListener;
+use rustls::ServerConfig;
 use tokio_util::sync::CancellationToken;
 use crate::lobby::room_info::LobbyHost;
 use crate::netconnection::{codec, NetConnection, StreamMessage};
@@ -34,7 +35,7 @@ pub struct AppData {
     session_manager: SessionManagerSender,
 }
 
-fn run_http_server(http_bind_address: String, appdata: Arc<AppData>) -> std::io::Result<JoinHandle<std::io::Result<()>>> {
+fn run_http_server(http_bind_address: String, tls_config: Option<ServerConfig>, appdata: Arc<AppData>) -> io::Result<JoinHandle<io::Result<()>>> {
     let logger_format = config_string("SERVER_LOGGER_FORMAT", "[%a][%{r}a] \"%r\" %s %b %D \"%{User-Agent}i\"");
     let workers = config_from_str::<usize>("SERVER_WORKERS", 0);
     let workers_blocking = config_from_str::<usize>("SERVER_WORKERS_BLOCKING", 0);
@@ -64,7 +65,11 @@ fn run_http_server(http_bind_address: String, appdata: Arc<AppData>) -> std::io:
                 if 0 < keep_alive {
                     server = server.keep_alive(KeepAlive::Timeout(Duration::from_millis(keep_alive)));
                 }
-                server.bind(http_bind_address)?.run().await
+                if let Some(config) = tls_config {
+                    server.bind_rustls_0_22(http_bind_address, config)
+                } else {
+                    server.bind(http_bind_address)
+                }?.run().await
             })
         }) {
         Err(err) => {
@@ -72,6 +77,43 @@ fn run_http_server(http_bind_address: String, appdata: Arc<AppData>) -> std::io:
             Err(err)
         }
         Ok(actix_thread) => Ok(actix_thread)
+    }
+}
+
+fn load_rustls_config() -> io::Result<Option<ServerConfig>> {
+    let http_cert = config_string("SERVER_HTTP_CERT", "");
+    let http_key = config_string("SERVER_HTTP_KEY", "");
+    if http_cert.is_empty() && http_key.is_empty() {
+        return Ok(None);
+    }
+    if http_cert.is_empty() {
+        return Err(io::Error::other("SERVER_HTTP_CERT provided but SERVER_HTTP_KEY missing"));
+    }
+    if http_key.is_empty() {
+        return Err(io::Error::other("SERVER_HTTP_KEY provided but SERVER_HTTP_CERT missing"));
+    }
+    
+    // load TLS key/cert files
+    let cert_file = &mut io::BufReader::new(File::open(http_cert)?);
+    let key_file = &mut io::BufReader::new(File::open(http_key)?);
+
+    // convert files to key/cert objects
+    let mut cert_chain = Vec::new();
+    for cert in rustls_pemfile::certs(cert_file) {
+        cert_chain.push(cert?);
+    }
+    let key = if let Some(key) = rustls_pemfile::private_key(key_file)? {
+        key
+    } else {
+        return Err(io::Error::other("Key file provided but no private key found inside"));
+    };
+
+    // init server config builder with safe defaults
+    match ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(cert_chain, key) {
+        Ok(config) => Ok(Some(config)),
+        Err(err) => Err(io::Error::other(err)),
     }
 }
 
@@ -87,7 +129,7 @@ pub async fn tcp_listener(session_manager: SessionManagerSender) -> Result<(), i
         }
     };
     log::info!("Binding TCP listener at: {:}", socketaddr);
-    let listener = match TcpListener::bind(socketaddr).await {
+    let listener = match tokio::net::TcpListener::bind(socketaddr).await {
         Ok(l) => {
             l
         }
@@ -134,19 +176,20 @@ pub async fn tcp_listener(session_manager: SessionManagerSender) -> Result<(), i
     Ok(())
 }
 
-async fn setup_app() -> std::io::Result<()> {
+async fn setup_app() -> io::Result<()> {
     let allowed_games_types: Vec<String> = dotenvy::var("SERVER_ALLOWED_GAME_TYPES")
         .unwrap_or_default()
         .split(",")
         .filter_map(|v| if v.is_empty() { None } else { Some(String::from(v)) })
         .collect();
+    let tls_config = load_rustls_config()?;
     let tcp_public_address = config_string("SERVER_TCP_PUBLIC_ADDRESS", "127.0.0.1:11654");
-    let http_bind_address = config_string("SERVER_HTTP_BIND_ADDRESS", "0.0.0.0:8888");
+    let http_bind_address = config_string("SERVER_HTTP_BIND_ADDRESS", if tls_config.is_some() { "0.0.0.0:8443" } else { "0.0.0.0:8080" });
     let mut http_public_address = config_string("SERVER_HTTP_PUBLIC_ADDRESS", http_bind_address.as_str());
     if !http_public_address.starts_with("http") && !http_public_address.contains("://") {
-        http_public_address = "http://".to_string() + http_public_address.as_str();
+        http_public_address = (if tls_config.is_some() { "https://" } else { "http://" }).to_string() + http_public_address.as_str();
     }
-    let ws_public_address = config_string("SERVER_WS_PUBLIC_ADDRESS", (http_public_address.replace("http", "ws")).as_str());
+    let ws_public_address = config_string("SERVER_WS_PUBLIC_ADDRESS", http_public_address.replace("http", "ws").as_str());
     log::info!(
         "Public relay address:\n\tHTTP = {}\n\tWS = {}\n\tTCP = {}",
         http_public_address,
@@ -176,7 +219,7 @@ async fn setup_app() -> std::io::Result<()> {
     }
 
     //Spin main HTTP server and wait, will finish if SIGINT is received;
-    let actix_thread = run_http_server(http_bind_address, app_data)?;
+    let actix_thread = run_http_server(http_bind_address, tls_config, app_data)?;
     actix_thread.join().unwrap_or_else(|err| {
         log::error!("Error occurred joining actix system thread: {:?}", err);
         Err(io::Error::other("Thread JoinHandle error"))
