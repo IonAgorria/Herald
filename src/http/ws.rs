@@ -239,8 +239,8 @@ async fn task_stream_handler<S>(
                 Err(io::Error::other(format!("{:} got unsupported frame Text", info)))
             },
             Frame::Binary(data) => {
-                let mut data_mut = BytesMut::with_capacity(data.len());
-                data_mut.copy_from_slice(data.as_ref());
+                let mut data_mut = BytesMut::new();
+                data_mut.extend_from_slice(data.as_ref());
                 match nc_decoder.decode_eof(&mut data_mut) {
                     Err(err) => Err(err),
                     //We do not expect new data to arrive
