@@ -3,15 +3,19 @@ use std::time::{SystemTime, Duration, UNIX_EPOCH, Instant};
 
 pub type Timestamp = (u64, u32);
 
-pub fn get_timestamp() -> Timestamp {
+pub fn duration_since_unix_epoch() -> Option<Duration> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
+        .ok()
+}
+
+pub fn get_timestamp() -> Timestamp {
+    duration_since_unix_epoch()
         .map_or((0, 0), |dur| (dur.as_secs(), dur.subsec_nanos()))
 }
 
 pub fn duration_since_timestamp(stamp: &Timestamp) -> Duration {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
+    duration_since_unix_epoch()
         .unwrap_or_default()
         .saturating_sub(Duration::from_nanos(stamp.1 as u64))
         .saturating_sub(Duration::from_secs(stamp.0))

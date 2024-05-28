@@ -11,7 +11,7 @@ use crate::lobby::lobby_manager::RoomJoinInfo;
 use crate::lobby::room_info::{LobbyHost, LobbyWithRooms, RoomInfo};
 use crate::netconnection::{NETID, NETID_ALL, NETID_HOST, NETID_NONE, NETID_RELAY};
 use crate::netconnection::NetConnectionMessage;
-use crate::utils::time::{duration_since_timestamp, get_timestamp};
+use crate::utils::time::{duration_since_timestamp, duration_since_unix_epoch, get_timestamp};
 use crate::utils::xprm::serialize_xprm_or_json;
 
 const NET_RELAY_PROTOCOL_VERSION: u8 = 1;
@@ -203,9 +203,11 @@ impl NetRelayMessagePeer {
                 let players_max = data.get_u16_le();
                 let topology = data.get_u16_le();
                 let extra_data = Self::read_map(data, 32, 64, 128)?;
+                let room_created_at = duration_since_unix_epoch().map(|d| d.as_secs()).unwrap_or(0);
                 NetRelayMessagePeer::SetupRoom {
                     info: RoomInfo {
                         room_id: 0,
+                        room_created_at,
                         game_type,
                         game_version,
                         room_name,
