@@ -126,6 +126,7 @@ impl LobbyManager {
         let room = match self.rooms.get(&info.room_id) {
             Some(room) => room,
             None => {
+                log::info!("{:} attempted to join a unknown room, info: {:}", conn, info);
                 Self::connection_close(conn, 2);
                 return;
             }
@@ -136,17 +137,22 @@ impl LobbyManager {
        if room.info.room_id != info.room_id
        || room.info.game_type != info.game_type
        || room.info.game_version != info.game_version {
+           log::info!("{:} attempted to join a incompatible room, info: {:} room: {:}", conn, info, room);
             Self::connection_close(conn, 3);
             return;
         }
         if room.info.room_closed {
+            log::info!("{:} attempted to join a closed room, info: {:} room: {:}", conn, info, room);
             Self::connection_close(conn, 4);
             return;
         }
 
         //Add to room
         if let Some(room) = self.rooms.get_mut(&info.room_id) {
+            log::info!("{:} joining a room, info: {:} room: {:}", conn, info, room);
             room.add_connection(conn).await;
+        } else {
+            log::error!("getting mutable room error when joining, conn {:} info: {:} room: {:}", conn, info, room);
         }
     }
     
