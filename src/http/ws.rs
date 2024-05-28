@@ -88,7 +88,7 @@ pub async fn handler(req: HttpRequest, payload: web::Payload, app_data: web::Dat
             Box::pin(ws_sink),
             Box::pin(ReceiverStream::new(msg_stream_rx))
         );
-        let ws_timeout = config_from_str::<u64>("SERVER_WS_TIMEOUT", 10000);
+        let ws_timeout = config_from_str::<u64>("SERVER_WS_TIMEOUT", 60000);
         connection.stream_mut().set_timeout(Duration::from_millis(ws_timeout));
         app_data.session_manager.incoming_connection(connection).await;
     });

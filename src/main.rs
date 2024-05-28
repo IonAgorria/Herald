@@ -120,7 +120,7 @@ fn load_rustls_config() -> io::Result<Option<ServerConfig>> {
 pub async fn tcp_listener(session_manager: SessionManagerSender) -> Result<(), io::Error> {
     let tcp_address = config_string("SERVER_TCP_BIND_ADDRESS", "0.0.0.0:11654");
     let tcp_linger = config_from_str::<u64>("SERVER_TCP_LINGER", 1);
-    let tcp_timeout = config_from_str::<u64>("SERVER_TCP_TIMEOUT", 10000);
+    let tcp_timeout = config_from_str::<u64>("SERVER_TCP_TIMEOUT", 60000);
     let socketaddr = match SocketAddr::from_str(tcp_address.as_str()) {
         Ok(a) => a,
         Err(err) => {

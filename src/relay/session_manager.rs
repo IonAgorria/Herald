@@ -51,7 +51,7 @@ impl SessionManager {
         let state = SessionManagerState {
             running: true,
             poll_interval: Duration::from_millis(config_from_str::<u64>("SERVER_SESSION_MANAGER_POLL_INTERVAL", 10)),
-            message_timeout: Duration::from_millis(config_from_str::<u64>("SERVER_SESSION_MANAGER_MESSAGE_TIMEOUT", 1000)),
+            message_timeout: Duration::from_millis(config_from_str::<u64>("SERVER_SESSION_MANAGER_MESSAGE_TIMEOUT", 60000)),
             queue_rx: queue_rx.0,
             peers: Default::default(),
             lobby_manager: LobbyManager::new(app_data.clone()),
