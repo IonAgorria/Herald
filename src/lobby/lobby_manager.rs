@@ -152,7 +152,7 @@ impl LobbyManager {
             log::info!("{:} joining a room, info: {:} room: {:}", conn, info, room);
             room.add_connection(conn).await;
         } else {
-            log::error!("getting mutable room error when joining, conn {:} info: {:} room: {:}", conn, info, room);
+            log::error!("getting mutable room error when joining, conn {:} info: {:}", conn, info);
         }
     }
     
