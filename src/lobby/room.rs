@@ -272,9 +272,21 @@ impl Room {
 
                     //Send to session manager
                     self.session_manager.incoming_connection(conn).await;
-                }
+                },
+                PeerRelayMessage::RemoveConnection(conn) => {
+                    //Remove any connections that rooms may have, this is usually sent to Room when a peer receives ClosePeer
+                    //Peer to peer doesn't need this since all is on same relay which already does internal cleanup
+                    if let RoomTopology::ServerClient { server_tx, clients_tx, .. } = &self.room_topology {
+                        let result = join!(
+                            server_tx.send(PeerRelayMessage::RemoveConnection(conn)),
+                            clients_tx.send(PeerRelayMessage::RemoveConnection(conn)),
+                        );
+                        if result.0.is_err() || result.1.is_err() {
+                            log::error!("{} Couldn't send sink message!", self);
+                        }
+                    };
+                },
                 PeerRelayMessage::StoreSink(_) |
-                PeerRelayMessage::RemoveConnection(_) |
                 PeerRelayMessage::RemoveSink(_) |
                 PeerRelayMessage::SetOwnership(_) => {
                     log::error!("{} received unexpected msg from relays: {}", self, msg);

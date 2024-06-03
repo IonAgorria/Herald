@@ -260,26 +260,28 @@ impl PeerRelay {
         }
     }
 
-    async fn handle_remove_sink(&mut self, netid: NETID) {
+    async fn handle_remove_sink(&mut self, netid: NETID) -> Option<NetConnectionSink> {
         log::debug!("{:} handle_remove_sink {:}", self, netid);
-        if let None = self.sinks.remove(&netid) {
+        let result = self.sinks.remove(&netid);
+        if let None = result {
             //Nothing was removed
             log::debug!("{:} handle_remove_sink {:} isn't present", self, netid);
-            return;
-        }
-
-        //Notify peers about it 
-        let self_str = self.to_string();
-        for conn in self.peers.values_mut() {
-            if conn.is_closed() {
-                continue;
+        } else {
+            //Notify peers about it 
+            let self_str = self.to_string();
+            for conn in self.peers.values_mut() {
+                if conn.is_closed() {
+                    continue;
+                }
+                if let Err(err) = conn.sink().send_relay_message(
+                    NetRelayMessageRelay::RemovePeer(netid), false
+                ).await {
+                    log::error!("{:} sending sink {:} removal to peer {:} error: {:}", self_str, netid, conn, err);
+                }
             }
-            if let Err(err) = conn.sink().send_relay_message(
-                NetRelayMessageRelay::RemovePeer(netid), false
-            ).await {
-                log::error!("{:} sending sink {:} removal to peer {:} error: {:}", self_str, netid, conn, err);
-            }
         }
+        
+        return result;
     }
 
     fn has_permission(&self, netid: NETID) -> bool {
@@ -500,9 +502,19 @@ impl PeerRelay {
             }
             NetRelayMessagePeer::ClosePeer(netid) => {
                 if self.has_permission(source_netid) {
-                    if let Some(conn) = self.peers.get_mut(&netid) {
-                        conn.close(978367384);
-                    };
+                    log::debug!("{:} got close peer message for {:}", source_netid, netid);
+                    //Remove before
+                    let sink_removed = self.handle_remove_sink(netid).await;
+                    if let Some(mut conn) = self.peers.remove(&netid) {
+                        conn.set_netid(NETID_NONE);
+                        if let Err(err) = self.room_tx.send(PeerRelayMessage::StoreConnection(conn)).await {
+                            log::error!("{:} Couldn't send StoreConnection message for ClosePeer! {:?}", self, err);
+                        }
+                    } else if let Some(sink) = sink_removed {
+                        if let Err(err) = self.room_tx.send(PeerRelayMessage::RemoveConnection(sink.get_netid())).await {
+                            log::error!("{:} Couldn't send RemoveSink message for ClosePeer! {:?}", self, err);
+                        }
+                    }
                 }
             }
             NetRelayMessagePeer::ListLobbyHosts { .. } |
