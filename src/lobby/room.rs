@@ -6,7 +6,7 @@ use tokio::sync::mpsc::error::TryRecvError;
 use tokio_util::sync::CancellationToken;
 use crate::lobby::room_info::RoomInfo;
 use crate::relay::peer_relay::{PeerRelay, PeerRelayCloseMode, PeerRelayConfig, PeerRelayMessage, PeerRelayOwnership};
-use crate::netconnection::{NetConnection, NETID, NETID_CLIENTS_RELAY_START};
+use crate::netconnection::{NetConnection, NETID, NETID_CLIENTS_RELAY_START, NETID_NONE, NETID_BRIDGES_START};
 use crate::relay::session_manager::SessionManagerSender;
 use crate::utils::config_from_str;
 
@@ -39,6 +39,8 @@ pub struct Room {
     peers: usize,
     ///Next NETID to give to a incoming client
     client_netid_next: NETID,
+    ///Next NETID to give to a incoming bridge
+    bridge_netid_next: NETID,
     ///Token to cancel task
     cancellation: CancellationToken,
     ///Max amount of messages to poll from channels on each update
@@ -92,6 +94,7 @@ impl Room {
             channel_msgs_per_update: config_from_str::<usize>("SERVER_ROOM_TASK_CHANNEL_MSGS_PER_UPDATE", 10),
             peers: 1,
             client_netid_next: NETID_CLIENTS_RELAY_START,
+            bridge_netid_next: NETID_BRIDGES_START,
             room_topology: RoomTopology::ServerClient {
                 server_tx: room_to_server_tx,
                 server_rx: server_to_room_rx,
@@ -131,6 +134,7 @@ impl Room {
             channel_msgs_per_update: config_from_str::<usize>("SERVER_ROOM_TASK_CHANNEL_MSGS_PER_UPDATE", 10),
             peers: 1,
             client_netid_next: NETID_CLIENTS_RELAY_START,
+            bridge_netid_next: NETID_BRIDGES_START,
             room_topology: RoomTopology::PeerToPeer {
                 relay_tx,
                 relay_rx,
@@ -154,14 +158,29 @@ impl Room {
         }
     }
 
-    pub async fn add_connection(&mut self, mut conn: NetConnection) {
+    pub async fn add_connection(&mut self, mut conn: NetConnection, bridge: bool) {
         if self.cancellation.is_cancelled() {
             return;
         }
 
         //Assign NETID to connection
-        let netid = self.client_netid_next;
-        self.client_netid_next += 1;
+        if conn.get_netid() != NETID_NONE {
+            log::info!("{} got connection with unexpected NETID {}", self, conn);
+            conn.close(892378183);
+            return;
+        }
+        let netid = if bridge {
+            if self.bridge_netid_next == NETID_CLIENTS_RELAY_START {
+                log::error!("Reached end of bridges NETIDs");
+                conn.close(874827534);
+                return;
+            }
+            self.bridge_netid_next += 1;
+            self.bridge_netid_next
+        } else {
+            self.client_netid_next += 1;
+            self.client_netid_next
+        };
         conn.set_netid(netid);
 
         //Handle per topology
@@ -260,31 +279,36 @@ impl Room {
                 PeerRelayMessage::StoreConnection(conn) => {
                     //Remove any sink that rooms may have
                     //Peer to peer doesn't need this since all is on same relay which already does internal cleanup
-                    if let RoomTopology::ServerClient { server_tx, clients_tx, .. } = &self.room_topology {
-                        let result = join!(
-                            server_tx.send(PeerRelayMessage::RemoveSink(conn.get_netid())),
-                            clients_tx.send(PeerRelayMessage::RemoveSink(conn.get_netid())),
-                        );
-                        if result.0.is_err() || result.1.is_err() {
-                            log::error!("{} Couldn't send sink message!", self);
-                        }
-                    };
+                    let netid = conn.get_netid();
+                    if netid != NETID_NONE {
+                        if let RoomTopology::ServerClient { server_tx, clients_tx, .. } = &self.room_topology {
+                            let result = join!(
+                                server_tx.send(PeerRelayMessage::RemoveSink(netid)),
+                                clients_tx.send(PeerRelayMessage::RemoveSink(netid)),
+                            );
+                            if result.0.is_err() || result.1.is_err() {
+                                log::error!("{} Couldn't send sink message!", self);
+                            }
+                        };
+                    }
 
                     //Send to session manager
                     self.session_manager.incoming_connection(conn).await;
                 },
-                PeerRelayMessage::RemoveConnection(conn) => {
+                PeerRelayMessage::RemoveConnection(netid) => {
                     //Remove any connections that rooms may have, this is usually sent to Room when a peer receives ClosePeer
                     //Peer to peer doesn't need this since all is on same relay which already does internal cleanup
-                    if let RoomTopology::ServerClient { server_tx, clients_tx, .. } = &self.room_topology {
-                        let result = join!(
-                            server_tx.send(PeerRelayMessage::RemoveConnection(conn)),
-                            clients_tx.send(PeerRelayMessage::RemoveConnection(conn)),
-                        );
-                        if result.0.is_err() || result.1.is_err() {
-                            log::error!("{} Couldn't send sink message!", self);
-                        }
-                    };
+                    if netid != NETID_NONE {
+                        if let RoomTopology::ServerClient { server_tx, clients_tx, .. } = &self.room_topology {
+                            let result = join!(
+                                server_tx.send(PeerRelayMessage::RemoveConnection(netid)),
+                                clients_tx.send(PeerRelayMessage::RemoveConnection(netid)),
+                            );
+                            if result.0.is_err() || result.1.is_err() {
+                                log::error!("{} Couldn't send sink message!", self);
+                            }
+                        };
+                    }
                 },
                 PeerRelayMessage::StoreSink(_) |
                 PeerRelayMessage::RemoveSink(_) |

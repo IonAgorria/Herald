@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio_util::bytes::Bytes;
 use tokio_util::sync::CancellationToken;
-use crate::relay::messages::NetRelayMessageRelay;
+use crate::relay::messages::NetRelayMessage;
 use crate::utils::config_from_str;
 
 pub type NETID = u64;
@@ -18,7 +18,8 @@ pub const NETID_RELAY: NETID = 2;
 pub const NETID_ALL: NETID = 3;
 /// The first NETID to start with for room NETIDs
 /// Number is high to ensure games can allocate lower NETIDs for local use if required
-pub const NETID_CLIENTS_RELAY_START: NETID = 0x10000;
+pub const NETID_BRIDGES_START:       NETID = 0x10000;
+pub const NETID_CLIENTS_RELAY_START: NETID = 0x20000;
 
 pub enum StreamMessage {
     PingResponse,
@@ -28,7 +29,11 @@ pub enum StreamMessage {
 pub type NetConnectionMessageStream = Pin<Box<dyn Stream<Item = io::Result<StreamMessage>> + Send + Sync + 'static>>;
 pub type NetConnectionMessageSink = Pin<Box<dyn Sink<NetConnectionMessage, Error = io::Error> + Send + Sync + 'static>>;
 
-#[derive(Debug)]
+pub fn is_bridge_netid(netid: NETID) -> bool {
+    NETID_BRIDGES_START <= netid && netid < NETID_CLIENTS_RELAY_START
+}
+
+#[derive(Debug, Clone)]
 pub struct NetConnectionMessage {
     ///The message's source NETID
     pub source_netid: NETID,
@@ -273,7 +278,7 @@ impl NetConnectionSink {
             }
         }
         //Send close message, close sink and set flag
-        match Bytes::try_from(NetRelayMessageRelay::Close(close_code)) {
+        match Bytes::try_from(NetRelayMessage::Close(close_code)) {
             Err(err) => log::error!("NetConnectionSink::task send close error {:?}", err),
             Ok(data) => {
                 let _ = sink.feed(NetConnectionMessage {
@@ -343,7 +348,7 @@ impl NetConnectionSink {
         self.send(NetConnectionSinkMessage::Send(msg, flush)).await
     }
 
-    pub async fn send_relay_message(&self, msg: NetRelayMessageRelay, flush: bool) -> Result<(), NetConnectionWrite> {
+    pub async fn send_relay_message(&self, msg: NetRelayMessage, flush: bool) -> Result<(), NetConnectionWrite> {
         let data = Bytes::try_from(msg).map_err(|err| NetConnectionWrite::IO(err))?;
         self.send_message(
             NetConnectionMessage {
