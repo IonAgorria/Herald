@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fmt::{Display, Formatter};
 use std::time::Duration;
@@ -11,10 +11,10 @@ use futures_util::{stream, StreamExt};
 use tokio::{select, time};
 use tokio_util::sync::CancellationToken;
 use crate::lobby::room_info::{RoomID, RoomInfo};
-use crate::netconnection::{NetConnection, NetConnectionMessage, NetConnectionRead, NetConnectionSink, NETID, NETID_ALL, NETID_NONE, NETID_RELAY};
-use crate::relay::messages::{NetRelayMessagePeer, NetRelayMessageRelay};
+use crate::netconnection::{is_bridge_netid, NetConnection, NetConnectionMessage, NetConnectionRead, NetConnectionSink, NETID, NETID_ALL, NETID_NONE, NETID_RELAY};
+use crate::relay::messages::NetRelayMessage;
 use crate::utils::config_from_str;
-use crate::utils::time::IntervalTimer;
+use crate::utils::time::{get_timestamp, IntervalTimer};
 
 #[derive(Clone, Debug)]
 pub struct PeerRelayStatus {
@@ -60,6 +60,12 @@ pub enum PeerRelayMessage {
     UpdateStatus(PeerRelayStatus),
     #[allow(dead_code)]
     SetOwnership(PeerRelayOwnership),
+}
+
+#[derive(Debug)]
+pub struct  PeerRelayBridge {
+    netid: NETID,
+    peers: HashSet<NETID>,
 }
 
 #[derive(Debug, Clone)]
@@ -118,6 +124,8 @@ pub struct PeerRelay {
     sinks: HashMap<NETID, NetConnectionSink>,
     ///Most recent status info to send
     status: PeerRelayStatus,
+    ///Bridges info
+    bridges: HashMap<NETID, PeerRelayBridge>,
 }
 
 impl PeerRelay {
@@ -145,6 +153,7 @@ impl PeerRelay {
             peers,
             sinks,
             status: PeerRelayStatus::new(),
+            bridges: Default::default(),
         }
     }
     
@@ -206,15 +215,28 @@ impl PeerRelay {
         }
         self.peers.clear();
         self.sinks.clear();
+        self.bridges.clear();
         self.status.pings.clear();
     }
     
     async fn send_list_peers(&self, sink: &NetConnectionSink) {
         //Send list of current peers
+        let mut peers = Vec::new();
+        for sink in self.sinks.values() {
+            let netid = sink.get_netid();
+            if !is_bridge_netid(netid) {
+                peers.push(netid);
+            }
+        }
+        for bridge in self.bridges.values() {
+            for netid in &bridge.peers {
+                if !is_bridge_netid(*netid) {
+                    peers.push(*netid);
+                }
+            }
+        }
         if let Err(err) = sink.send_relay_message(
-            NetRelayMessageRelay::ListPeers(
-                self.sinks.keys().map(NETID::to_owned).collect()
-            ), false
+            NetRelayMessage::RelayListPeers(peers), false
         ).await {
             log::error!("{:} sending list peers to {:} error: {:}", self, sink, err);
         }
@@ -222,21 +244,54 @@ impl PeerRelay {
 
     async fn handle_store_connection(&mut self, mut conn: NetConnection) {
         log::debug!("{:} handle_store_connection {:}", self, conn);
-        if self.peers.contains_key(&conn.get_netid()) {
-            log::debug!("{:} handle_store_connection {:} already added", self, conn.get_netid());
+        conn.stream_mut().update_last_contact();
+        let netid = conn.get_netid();
+        if self.peers.contains_key(&netid) {
+            log::debug!("{:} handle_store_connection {:} peer already added", self, netid);
             return;
         }
-        self.send_list_peers(conn.sink()).await;
-        conn.stream_mut().update_last_contact();
-        self.peers.insert(conn.get_netid(), conn);
+        if is_bridge_netid(netid) {
+            if self.bridges.contains_key(&netid) {
+                log::debug!("{:} handle_store_connection {:} bridge already added", self, netid);
+                return;
+            }
+            self.bridges.insert(netid, PeerRelayBridge {
+                netid,
+                peers: Default::default(),
+            });
+        } else {
+            self.send_list_peers(conn.sink()).await;
+        }
+        self.peers.insert(netid, conn);
     }
 
     async fn handle_remove_connection(&mut self, netid: NETID) {
         log::debug!("{:} handle_remove_connection {:}", self, netid);
+        if is_bridge_netid(netid) {
+            if let Some(bridge) = self.bridges.remove(&netid) {
+                assert_eq!(bridge.netid, netid);
+                //Notify peers about it 
+                let self_str = self.to_string();
+                for bridge_peer in &bridge.peers {
+                    for conn in self.peers.values() {
+                        if conn.is_closed() || conn.get_netid() == netid || is_bridge_netid(netid) {
+                            continue;
+                        }
+                        if let Err(err) = conn.sink().send_relay_message(
+                            NetRelayMessage::RelayRemovePeer(*bridge_peer), false
+                        ).await {
+                            log::error!("{:} handle_remove_connection sending sink {:} removal to bridge peer {:} error: {:}", self_str, netid, conn, err);
+                        }
+                    }
+                }
+            } else {
+                //Nothing was removed
+                log::debug!("{:} handle_remove_connection {:} bridge isn't present", self, netid);
+            }
+        }
         if let None = self.peers.remove(&netid) {
             //Nothing was removed
-            log::debug!("{:} handle_remove_connection {:} isn't present", self, netid);
-            return;
+            log::debug!("{:} handle_remove_connection {:} peer isn't present", self, netid);
         }
     }
 
@@ -248,14 +303,16 @@ impl PeerRelay {
         }
         log::debug!("{:} handle_store_sink {:}", self, netid);
         self.sinks.insert(netid, sink);
-
-        //Notify peers about it 
-        let self_str = self.to_string();
-        for conn in self.peers.values_mut() {
-            if let Err(err) = conn.sink().send_relay_message(
-                NetRelayMessageRelay::AddPeer(netid), false
-            ).await {
-                log::error!("{:} sending sink {:} addition to peer {:} error: {:}", self_str, netid, conn, err);
+        
+        if !is_bridge_netid(netid) {
+            //Notify peers about it 
+            let self_str = self.to_string();
+            for conn in self.peers.values() {
+                if let Err(err) = conn.sink().send_relay_message(
+                    NetRelayMessage::RelayAddPeer(netid), false
+                ).await {
+                    log::error!("{:} sending sink {:} addition to peer {:} error: {:}", self_str, netid, conn, err);
+                }
             }
         }
     }
@@ -269,12 +326,12 @@ impl PeerRelay {
         } else {
             //Notify peers about it 
             let self_str = self.to_string();
-            for conn in self.peers.values_mut() {
+            for conn in self.peers.values() {
                 if conn.is_closed() {
                     continue;
                 }
                 if let Err(err) = conn.sink().send_relay_message(
-                    NetRelayMessageRelay::RemovePeer(netid), false
+                    NetRelayMessage::RelayRemovePeer(netid), false
                 ).await {
                     log::error!("{:} sending sink {:} removal to peer {:} error: {:}", self_str, netid, conn, err);
                 }
@@ -319,12 +376,13 @@ impl PeerRelay {
         }
     }
     
-    async fn ping_peers(&mut self) {
+    async fn ping_peers(&self) {
         for conn in self.peers.values() {
             if !conn.stream().is_last_contact_more_than(self.config.ping_wait_time) {
                 continue;
             }
-            if let Err(err) = conn.sink().send_relay_message(NetRelayMessageRelay::Ping, false).await {
+            let stamp = get_timestamp();
+            if let Err(err) = conn.sink().send_relay_message(NetRelayMessage::RelayPing(stamp), false).await {
                 log::error!("{:} ping message to {:} error: {:}", self, conn, err);
             }
         }
@@ -399,6 +457,9 @@ impl PeerRelay {
                 } else if msg.destination_netid == NETID_NONE {
                     log::debug!("{:} peer {:} sent message to NETID_NONE: {:}", self_str, conn, msg);
                     conn.close(98275737);
+                } else if is_bridge_netid(msg.destination_netid) {
+                    log::debug!("{:} peer {:} sent message to NETID_BRIDGE: {:}", self_str, conn, msg);
+                    conn.close(98275868);
                 } else if msg.destination_netid == NETID_RELAY {
                     relay_msgs.push(msg);
                 } else {
@@ -414,29 +475,25 @@ impl PeerRelay {
         stream::iter(peers_msgs).for_each_concurrent(
             Some(self.config.msgs_per_poll),
             |msg| async {
-                if msg.destination_netid == NETID_ALL {
-                    //We need to send this message to all clients, so craft a message with each client destination
-                    for sink in self.sinks.values() {
-                        let destination_netid = sink.get_netid();
-                        let client_msg = NetConnectionMessage {
-                            source_netid: msg.source_netid,
-                            destination_netid,
-                            compressed: msg.compressed,
-                            data: msg.data.clone(),
-                        };
-                        let info_task = self_str.clone();
-                        let result = sink.send_message(client_msg, false).await;
-                        if let Err(err) = result {
-                            log::error!("{:} sending message to sink {:} error: {:}", info_task, sink, err);
-                        }
+                let msg = msg;
+                let destination_netid = msg.destination_netid;
+                let mut found = destination_netid == NETID_ALL;
+                for sink in self.sinks.values() {
+                    let sink_netid = sink.get_netid();
+                    if destination_netid != NETID_ALL
+                    && !is_bridge_netid(sink_netid)
+                    && destination_netid != sink_netid {
+                        continue;
                     }
-                } else if let Some(sink) = self.sinks.get(&msg.destination_netid) {
-                    if !sink.is_closed() {
-                        if let Err(err) = sink.send_message(msg, false).await {
-                            log::error!("{:} sending message to sink {:} error: {:}", self_str, sink, err);
-                        }
+                    
+                    found = true;
+                    let info_task = self_str.clone();
+                    let result = sink.send_message(msg.clone(), false).await;
+                    if let Err(err) = result {
+                        log::error!("{:} sending message to sink {:} error: {:}", info_task, sink, err);
                     }
-                } else {
+                }
+                if !found {
                     log::error!("{:} unknown destination for message: {:}", self_str, msg);
                 }
             }
@@ -446,9 +503,6 @@ impl PeerRelay {
         for msg in relay_msgs {
             self.handle_relay_message(msg).await;
         }
-
-        //Run futures concurrently
-        //while let Some(_) = futures.next().await {};
         
         //Flush sinks to send messages
         for sink in self.sinks.values() {
@@ -461,9 +515,10 @@ impl PeerRelay {
         }
     }
     
+    ///Handle messages directed at relay from peers
     async fn handle_relay_message(&mut self, msg: NetConnectionMessage) {
         let source_netid = msg.source_netid;
-        let peer_msg = match NetRelayMessagePeer::try_from(msg) {
+        let peer_msg = match NetRelayMessage::try_from(msg) {
             Ok(peer_msg) => peer_msg,
             Err(err) => {
                 log::error!("{:} peer {:} error decoding relay message: {:?}", self, source_netid, err);
@@ -473,53 +528,87 @@ impl PeerRelay {
         log::debug!("{:} handle_relay_message {:} msg {:?}", self, source_netid, peer_msg);
 
         match peer_msg {
-            NetRelayMessagePeer::Close(code) => {
+            NetRelayMessage::Close(code) => {
                 if let Some(conn) = self.peers.get_mut(&source_netid) {
                     log::debug!("{:} got close message code {:}", conn, code);
                     conn.close(972534431);
                 }
                 self.handle_remove_sink(source_netid).await;
             }
-            NetRelayMessagePeer::LeaveRoom => {
-                if let Some(mut conn) = self.peers.remove(&source_netid) {
-                    conn.set_netid(NETID_NONE);
+            NetRelayMessage::PeerLeaveRoom => {
+                if let Some(conn) = self.peers.remove(&source_netid) {
                     if let Err(err) = self.room_tx.send(PeerRelayMessage::StoreConnection(conn)).await {
                         log::error!("{:} Couldn't send StoreConnection message for LeaveRoom! {:?}", self, err);
                     }
                 }
                 self.handle_remove_sink(source_netid).await;
             }
-            NetRelayMessagePeer::SetupRoom { info, .. } => {
+            NetRelayMessage::PeerSetupRoom { info, .. } => {
                 if self.has_permission(source_netid) {
                     self.status.info = Some(info);
                 }
             }
-            NetRelayMessagePeer::PingResponse(ping) => {
+            NetRelayMessage::PeerPingResponse(ping) => {
                 if let Some(conn) = self.peers.get_mut(&source_netid) {
                     conn.stream_mut().update_last_contact();
                     self.status.pings.insert(source_netid, ping.as_millis() as u32);
                 }
             }
-            NetRelayMessagePeer::ClosePeer(netid) => {
+            NetRelayMessage::PeerClosePeer(netid) => {
                 if self.has_permission(source_netid) {
-                    log::debug!("{:} got close peer message for {:}", source_netid, netid);
-                    //Remove before
-                    let sink_removed = self.handle_remove_sink(netid).await;
-                    if let Some(mut conn) = self.peers.remove(&netid) {
-                        conn.set_netid(NETID_NONE);
-                        if let Err(err) = self.room_tx.send(PeerRelayMessage::StoreConnection(conn)).await {
-                            log::error!("{:} Couldn't send StoreConnection message for ClosePeer! {:?}", self, err);
-                        }
-                    } else if let Some(sink) = sink_removed {
-                        if let Err(err) = self.room_tx.send(PeerRelayMessage::RemoveConnection(sink.get_netid())).await {
-                            log::error!("{:} Couldn't send RemoveSink message for ClosePeer! {:?}", self, err);
+                    if is_bridge_netid(netid) {
+                        log::error!("{:} got close peer message for bridge {:}", source_netid, netid); 
+                    } else {
+                        log::debug!("{:} got close peer message for {:}", source_netid, netid);
+                        //Remove before
+                        let sink_removed = self.handle_remove_sink(netid).await;
+                        if let Some(conn) = self.peers.remove(&netid) {
+                            if let Err(err) = self.room_tx.send(PeerRelayMessage::StoreConnection(conn)).await {
+                                log::error!("{:} Couldn't send StoreConnection message for ClosePeer! {:?}", self, err);
+                            }
+                        } else if let Some(sink) = sink_removed {
+                            if let Err(err) = self.room_tx.send(PeerRelayMessage::RemoveConnection(sink.get_netid())).await {
+                                log::error!("{:} Couldn't send RemoveSink message for ClosePeer! {:?}", self, err);
+                            }
                         }
                     }
                 }
             }
-            NetRelayMessagePeer::ListLobbyHosts { .. } |
-            NetRelayMessagePeer::ListLobbies { .. } |
-            NetRelayMessagePeer::JoinRoom(_) => {
+            NetRelayMessage::RelayAddPeer(netid) => {
+                if let Some(bridge) = self.bridges.get_mut(&netid) {
+                    bridge.peers.insert(netid);
+                    //Notify peers about it 
+                    let self_str = self.to_string();
+                    for conn in self.peers.values() {
+                        if conn.is_closed() || is_bridge_netid(conn.get_netid()) {
+                            continue;
+                        }
+                        if let Err(err) = conn.sink().send_relay_message(
+                            NetRelayMessage::RelayAddPeer(netid), false
+                        ).await {
+                            log::error!("{:} sending sink {:} removal to peer {:} error: {:}", self_str, netid, conn, err);
+                        }
+                    }
+                }
+            }
+            NetRelayMessage::RelayRemovePeer(netid) => {
+                if let Some(bridge) = self.bridges.get_mut(&netid) {
+                    bridge.peers.remove(&netid);
+                    //Notify peers about it 
+                    let self_str = self.to_string();
+                    for conn in self.peers.values() {
+                        if conn.is_closed() || is_bridge_netid(conn.get_netid()) {
+                            continue;
+                        }
+                        if let Err(err) = conn.sink().send_relay_message(
+                            NetRelayMessage::RelayRemovePeer(netid), false
+                        ).await {
+                            log::error!("{:} sending sink {:} removal to peer {:} error: {:}", self_str, netid, conn, err);
+                        }
+                    }
+                }
+            }
+            _ => {
                 log::debug!("{:} unknown relay message: {:?}", self, peer_msg);
             }
         }
@@ -570,6 +659,12 @@ impl Display for PeerRelayStatus {
         write!(f, "PeerRelayStatus {{ Peers/Sinks {}/{}, Pings: {:?}, Info: {:?} }}",
                self.peers, self.sinks, self.pings, self.info
         )
+    }
+}
+
+impl Display for PeerRelayBridge {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", self)
     }
 }
 

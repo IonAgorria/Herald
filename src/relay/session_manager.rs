@@ -6,15 +6,15 @@ use tokio::time::interval;
 use crate::AppData;
 use crate::lobby::lobby_manager::LobbyManager;
 use crate::lobby::room_info::LobbyWithRooms;
-use crate::relay::messages::{NetRelayMessagePeer, NetRelayMessageRelay};
+use crate::relay::messages::NetRelayMessage;
 use crate::netconnection::{NETID_NONE, NetConnection, NetConnectionRead};
 use crate::utils::config_from_str;
 
 enum SessionManagerMessage {
     Ping(SystemTime),
     StoreConnection(NetConnection),
-    TransferConnection(NetConnection, NetRelayMessagePeer),
-    ReplyConnection(NetConnection, NetRelayMessagePeer),
+    TransferConnection(NetConnection, NetRelayMessage),
+    ReplyConnection(NetConnection, NetRelayMessage),
 }
 
 #[derive(Clone)]
@@ -132,11 +132,14 @@ impl SessionManagerState {
             }
             SessionManagerMessage::TransferConnection(mut conn, msg) => {
                 match msg {
-                    NetRelayMessagePeer::SetupRoom { info, topology } => {
+                    NetRelayMessage::PeerSetupRoom { info, topology } => {
                         self.lobby_manager.connection_create_room(conn, info, topology).await;
                     },
-                    NetRelayMessagePeer::JoinRoom(info) => {
-                        self.lobby_manager.connection_join_room(conn, info).await;
+                    NetRelayMessage::PeerJoinRoom(info) => {
+                        self.lobby_manager.connection_peer_join_room(conn, info).await;
+                    },
+                    NetRelayMessage::PeerBridgeRoom { room_id: room, token } => {
+                        self.lobby_manager.connection_bridge_join_room(conn, room, token).await;
                     },
                     msg => {
                         log::error!("TransferConnection unknown message {:?}", msg);
@@ -191,7 +194,7 @@ impl SessionManagerState {
                 return;
             },
             NetConnectionRead::Data(msg) => {
-                match NetRelayMessagePeer::try_from(msg) {
+                match NetRelayMessage::try_from(msg) {
                     Ok(data) => data,
                     Err(err) => {
                         log::error!("Peer {:} error when parsing a message: {:?}", conn, err);
@@ -204,17 +207,18 @@ impl SessionManagerState {
 
         conn.stream_mut().update_last_contact();
         let queue_message = match message {
-            NetRelayMessagePeer::Close(code) => {
+            NetRelayMessage::Close(code) => {
                 log::debug!("Connection {:} got close message code {:}", conn, code);
                 return; //Conn dropped here
             }
-            NetRelayMessagePeer::ListLobbyHosts {..} |
-            NetRelayMessagePeer::ListLobbies {..} => {
+            NetRelayMessage::PeerListLobbyHosts {..} |
+            NetRelayMessage::PeerListLobbies {..} => {
                 //Reply with the rooms, we need access to rooms list
                 SessionManagerMessage::ReplyConnection(conn, message)
             }
-            NetRelayMessagePeer::SetupRoom {..} |
-            NetRelayMessagePeer::JoinRoom(..) => {
+            NetRelayMessage::PeerSetupRoom {..} |
+            NetRelayMessage::PeerJoinRoom(..) |
+            NetRelayMessage::PeerBridgeRoom {..} => {
                 //Needs to be transferred to a room, but we can't do that inside this task
                 SessionManagerMessage::TransferConnection(conn, message)
             },
@@ -229,10 +233,10 @@ impl SessionManagerState {
         }
     }
     
-    async fn task_process_connection_reply(mut conn: NetConnection, msg_peer: NetRelayMessagePeer, app_data: Arc<AppData>) {
+    async fn task_process_connection_reply(mut conn: NetConnection, msg_peer: NetRelayMessage, app_data: Arc<AppData>) {
         //First assemble the relay reply
         let msg = match msg_peer {
-            NetRelayMessagePeer::ListLobbies { game_type, format, .. } => {
+            NetRelayMessage::PeerListLobbies { game_type, format, .. } => {
                 let room_infos_guard = app_data.room_infos.load();
                 let lobbies = vec![
                     LobbyWithRooms {
@@ -240,16 +244,16 @@ impl SessionManagerState {
                         rooms: LobbyManager::filter_room_by_game_type(&room_infos_guard, &game_type),
                     }
                 ];
-                NetRelayMessageRelay::ListLobbies {
+                NetRelayMessage::RelayListLobbies {
                     lobbies,
                     format,
                 }
             },
-            NetRelayMessagePeer::ListLobbyHosts { format, .. } => {
+            NetRelayMessage::PeerListLobbyHosts { format, .. } => {
                 let hosts = vec![
                     app_data.lobby_host.clone(),
                 ];
-                NetRelayMessageRelay::ListLobbyHosts {
+                NetRelayMessage::RelayListLobbyHosts {
                     hosts,
                     format,
                 }

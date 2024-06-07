@@ -8,10 +8,10 @@ use num_traits::FromPrimitive;
 use tokio_util::bytes::{Buf, BufMut, Bytes};
 use serde::{Serialize};
 use crate::lobby::lobby_manager::RoomJoinInfo;
-use crate::lobby::room_info::{LobbyHost, LobbyWithRooms, RoomInfo};
+use crate::lobby::room_info::{LobbyHost, LobbyWithRooms, RoomID, RoomInfo};
 use crate::netconnection::{NETID, NETID_ALL, NETID_HOST, NETID_NONE, NETID_RELAY};
 use crate::netconnection::NetConnectionMessage;
-use crate::utils::time::{duration_since_timestamp, duration_since_unix_epoch, get_timestamp};
+use crate::utils::time::{duration_since_timestamp, Timestamp};
 use crate::utils::xprm::serialize_xprm_or_json;
 
 const NET_RELAY_PROTOCOL_VERSION: u8 = 1;
@@ -35,6 +35,7 @@ pub enum NetRelayMessageType {
     RELAY_MSG_PEER_PING_RESPONSE,
     RELAY_MSG_PEER_CLOSE_PEER,
     RELAY_MSG_PEER_LIST_LOBBY_HOSTS,
+    RELAY_MSG_PEER_BRIDGE_ROOM,
 
     //Sent by relay to peer
     RELAY_MSG_RELAY_START = 0x20000,
@@ -59,52 +60,48 @@ pub enum NetRelayMessageError {
     NotUTF8String(usize),
 }
 
-/// Sent by peer
 #[derive(Debug)]
-pub enum NetRelayMessagePeer {
+pub enum NetRelayMessage {
     Close(u32),
-    PingResponse(Duration),
-    ListLobbyHosts {
-        #[allow(dead_code)]
+    /// Sent by peer
+    PeerPingResponse(Duration),
+    PeerListLobbyHosts {
         game_type: String,
-        #[allow(dead_code)]
         game_version: String,
         format: u16,
     },
-    ListLobbies {
+    PeerListLobbies {
         game_type: String,
-        #[allow(dead_code)]
         game_version: String,
         format: u16,
     },
-    SetupRoom {
+    PeerSetupRoom {
         info: RoomInfo,
         topology: u16,
     },
-    JoinRoom(RoomJoinInfo),
-    LeaveRoom,
-    ClosePeer(NETID),
-}
-
-/// Sent by server
-#[derive(Debug)]
-pub enum NetRelayMessageRelay {
-    Close(u32),
-    Ping,
-    ListLobbyHosts {
+    PeerJoinRoom(RoomJoinInfo),
+    PeerLeaveRoom,
+    PeerClosePeer(NETID),
+    PeerBridgeRoom {
+        room_id: RoomID,
+        token: String,
+    },
+    /// Sent by relay
+    RelayPing(Timestamp),
+    RelayListLobbyHosts {
         hosts: Vec<LobbyHost>,
         format: u16
     },
-    ListLobbies {
+    RelayListLobbies {
         lobbies: Vec<LobbyWithRooms>,
         format: u16
     },
-    ListPeers(Vec<NETID>),
-    AddPeer(NETID),
-    RemovePeer(NETID),
+    RelayListPeers(Vec<NETID>),
+    RelayAddPeer(NETID),
+    RelayRemovePeer(NETID),
 }
 
-impl NetRelayMessagePeer {
+impl NetRelayMessage {
     pub fn read_string(data: &mut Bytes, max_len: u16) -> Result<String, NetRelayMessageError> {
         let len = data.get_u16_le();
         if len > max_len.min(NET_RELAY_MAX_STRING_LENGTH) {
@@ -172,14 +169,14 @@ impl NetRelayMessagePeer {
         let result = match msg_type {
             NetRelayMessageType::RELAY_MSG_CLOSE => {
                 let code  = data.get_u32_le();
-                NetRelayMessagePeer::Close(code)
+                NetRelayMessage::Close(code)
             },
-            NetRelayMessageType::RELAY_MSG_PEER_LEAVE_ROOM => NetRelayMessagePeer::LeaveRoom,
+            NetRelayMessageType::RELAY_MSG_PEER_LEAVE_ROOM => NetRelayMessage::PeerLeaveRoom,
             NetRelayMessageType::RELAY_MSG_PEER_LIST_LOBBY_HOSTS => {
                 let game_type = Self::read_string(data, 32)?;
                 let game_version = Self::read_string(data, 32)?;
                 let format = data.get_u16_le();
-                NetRelayMessagePeer::ListLobbyHosts {
+                NetRelayMessage::PeerListLobbyHosts {
                     game_type,
                     game_version,
                     format
@@ -189,7 +186,7 @@ impl NetRelayMessagePeer {
                 let game_type = Self::read_string(data, 32)?;
                 let game_version = Self::read_string(data, 32)?;
                 let format = data.get_u16_le();
-                NetRelayMessagePeer::ListLobbies {
+                NetRelayMessage::PeerListLobbies {
                     game_type,
                     game_version,
                     format
@@ -206,11 +203,11 @@ impl NetRelayMessagePeer {
                 let players_max = data.get_u16_le();
                 let topology = data.get_u16_le();
                 let extra_data = Self::read_map(data, 32, 64, 128)?;
-                let room_created_at = duration_since_unix_epoch().map(|d| d.as_secs()).unwrap_or(0);
-                NetRelayMessagePeer::SetupRoom {
+                NetRelayMessage::PeerSetupRoom {
                     info: RoomInfo {
                         room_id: 0,
-                        room_created_at,
+                        room_created_at: 0,
+                        room_bridged: Default::default(),
                         game_type,
                         game_version,
                         room_name,
@@ -229,30 +226,48 @@ impl NetRelayMessagePeer {
                 let game_type = Self::read_string(data, 32)?;
                 let game_version = Self::read_string(data, 32)?;
                 let room_id = data.get_u64_le();
-                NetRelayMessagePeer::JoinRoom(RoomJoinInfo {
+                NetRelayMessage::PeerJoinRoom(RoomJoinInfo {
                     game_type,
                     game_version,
                     room_id,
                 })
             },
+            NetRelayMessageType::RELAY_MSG_PEER_BRIDGE_ROOM => {
+                let room_id = data.get_u64_le();
+                let token = Self::read_string(data, 32)?;
+                NetRelayMessage::PeerBridgeRoom {
+                    room_id,
+                    token
+                }
+            },
             NetRelayMessageType::RELAY_MSG_PEER_PING_RESPONSE => {
                 let stamp_secs = data.get_u64_le();
                 let stamp_subsecs = data.get_u32_le();
                 let latency = duration_since_timestamp(&(stamp_secs, stamp_subsecs));
-                NetRelayMessagePeer::PingResponse(latency)
+                NetRelayMessage::PeerPingResponse(latency)
             },
             NetRelayMessageType::RELAY_MSG_PEER_CLOSE_PEER => {
                 let netid = data.get_u64_le();
-                NetRelayMessagePeer::ClosePeer(netid)
+                NetRelayMessage::PeerClosePeer(netid)
+            },
+            NetRelayMessageType::RELAY_MSG_RELAY_PING => {
+                let stamp_secs = data.get_u64_le();
+                let stamp_subsecs = data.get_u32_le();
+                NetRelayMessage::RelayPing((stamp_secs, stamp_subsecs))
+            },
+            NetRelayMessageType::RELAY_MSG_RELAY_ADD_PEER => {
+                let netid  = data.get_u64_le();
+                NetRelayMessage::RelayAddPeer(netid)
+            },
+            NetRelayMessageType::RELAY_MSG_RELAY_REMOVE_PEER => {
+                let netid  = data.get_u64_le();
+                NetRelayMessage::RelayRemovePeer(netid)
             },
             //Unknown and relay side messages go here   
             NetRelayMessageType::RELAY_MSG_PEER_START |
             NetRelayMessageType::RELAY_MSG_RELAY_START |
             NetRelayMessageType::RELAY_MSG_RELAY_LIST_LOBBIES |
-            NetRelayMessageType::RELAY_MSG_RELAY_PING |
             NetRelayMessageType::RELAY_MSG_RELAY_LIST_PEERS |
-            NetRelayMessageType::RELAY_MSG_RELAY_ADD_PEER |
-            NetRelayMessageType::RELAY_MSG_RELAY_REMOVE_PEER |
             NetRelayMessageType::RELAY_MSG_RELAY_LIST_LOBBY_HOSTS |
             NetRelayMessageType::RELAY_MSG_UNKNOWN => {
                 return Err(NetRelayMessageError::UnknownType(head));
@@ -261,19 +276,7 @@ impl NetRelayMessagePeer {
         
         Ok(result)
     }
-}
 
-impl TryFrom<NetConnectionMessage> for NetRelayMessagePeer {
-    type Error = io::Error;
-
-    fn try_from(value: NetConnectionMessage) -> Result<Self, Self::Error> {
-        NetRelayMessagePeer::from_message(value)
-            .map_err(io::Error::other)
-    }
-}
-
-
-impl NetRelayMessageRelay {
     fn write_header(buf: &mut BytesMut, msg_type: NetRelayMessageType) {
         let mut header = (msg_type as u32) & 0xFF_FFFF;
         header |= ((NET_RELAY_PROTOCOL_VERSION & 0xFF) as u32) << 24;
@@ -284,44 +287,46 @@ impl NetRelayMessageRelay {
         let mut buf = BytesMut::with_capacity(128);
         
         match self {
-            NetRelayMessageRelay::Close(code) => {
+            NetRelayMessage::Close(code) => {
                 Self::write_header(&mut buf, NetRelayMessageType::RELAY_MSG_CLOSE);
                 buf.put_u32_le(code);
             },
-            NetRelayMessageRelay::Ping => {
+            NetRelayMessage::RelayPing(stamp) => {
                 Self::write_header(&mut buf, NetRelayMessageType::RELAY_MSG_RELAY_PING);
-                let stamp = get_timestamp();
                 buf.put_u64_le(stamp.0);
                 buf.put_u32_le(stamp.1);
             },
-            NetRelayMessageRelay::ListLobbyHosts { hosts, format } => {
+            NetRelayMessage::RelayListLobbyHosts { hosts, format } => {
                 Self::write_header(&mut buf, NetRelayMessageType::RELAY_MSG_RELAY_LIST_LOBBY_HOSTS);
                 let xprm = format == 1;
                 let result = serialize_xprm_or_json(xprm, &hosts)
                     .map_err(|err| io::Error::other(err))?;
                 buf.put_slice(result.as_bytes());
             },
-            NetRelayMessageRelay::ListLobbies { lobbies, format } => {
+            NetRelayMessage::RelayListLobbies { lobbies, format } => {
                 Self::write_header(&mut buf, NetRelayMessageType::RELAY_MSG_RELAY_LIST_LOBBIES);
                 let xprm = format == 1;
                 let result = serialize_xprm_or_json(xprm, &lobbies)
                     .map_err(|err| io::Error::other(err))?;
                 buf.put_slice(result.as_bytes());
             },
-            NetRelayMessageRelay::ListPeers(peers) => {
+            NetRelayMessage::RelayListPeers(peers) => {
                 Self::write_header(&mut buf, NetRelayMessageType::RELAY_MSG_RELAY_LIST_PEERS);
                 buf.put_u32_le(peers.len() as u32);
                 for peer in peers {
                     buf.put_u64_le(peer);
                 }
             }
-            NetRelayMessageRelay::AddPeer(netid) => {
+            NetRelayMessage::RelayAddPeer(netid) => {
                 Self::write_header(&mut buf, NetRelayMessageType::RELAY_MSG_RELAY_ADD_PEER);
                 buf.put_u64_le(netid);
             }
-            NetRelayMessageRelay::RemovePeer(netid) => {
+            NetRelayMessage::RelayRemovePeer(netid) => {
                 Self::write_header(&mut buf, NetRelayMessageType::RELAY_MSG_RELAY_REMOVE_PEER);
                 buf.put_u64_le(netid);
+            }
+            msg => {
+                return Err(io::Error::other(format!("Unknown message type: {:?}", msg)));
             }
         }
 
@@ -329,19 +334,28 @@ impl NetRelayMessageRelay {
     }
 }
 
-impl TryFrom<NetRelayMessageRelay> for BytesMut {
+impl TryFrom<NetRelayMessage> for BytesMut {
     type Error = io::Error;
 
-    fn try_from(value: NetRelayMessageRelay) -> Result<Self, Self::Error> {
+    fn try_from(value: NetRelayMessage) -> Result<Self, Self::Error> {
         value.into_bytes_mut()
     }
 }
 
-impl TryFrom<NetRelayMessageRelay> for Bytes {
+impl TryFrom<NetRelayMessage> for Bytes {
     type Error = io::Error;
 
-    fn try_from(value: NetRelayMessageRelay) -> Result<Self, Self::Error> {
+    fn try_from(value: NetRelayMessage) -> Result<Self, Self::Error> {
         BytesMut::try_from(value).map(|v| v.freeze())
+    }
+}
+
+impl TryFrom<NetConnectionMessage> for NetRelayMessage {
+    type Error = io::Error;
+
+    fn try_from(value: NetConnectionMessage) -> Result<Self, Self::Error> {
+        NetRelayMessage::from_message(value)
+            .map_err(io::Error::other)
     }
 }
 

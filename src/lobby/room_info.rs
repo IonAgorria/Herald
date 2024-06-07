@@ -57,6 +57,9 @@ pub struct RoomInfo {
     pub room_id: RoomID,
     ///When was room created
     pub room_created_at: u64,
+    ///The source from which the room is bridged if any
+    #[validate(length(min = 0, max = 32))]
+    pub room_bridged: String,
     ///Game identifier for this room 
     #[validate(length(min = 5, max = 32))]
     pub game_type: String,

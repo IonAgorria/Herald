@@ -8,6 +8,8 @@ use crate::AppData;
 use crate::lobby::room_info::{RoomInfo, RoomID};
 use crate::lobby::room::Room;
 use crate::netconnection::{NetConnection, NETID_HOST};
+use crate::utils::config_string;
+use crate::utils::time::duration_since_unix_epoch;
 
 type RoomMap = HashMap<RoomID, Room>;
 pub type CurrentRoomInfos = ArcSwap<Vec<RoomInfo>>;
@@ -37,6 +39,8 @@ pub struct LobbyManager {
     rooms: RoomMap,
     ///App data
     app_data: Arc<AppData>,
+    ///Token for bridging rooms
+    bridge_token: String,
 }
 
 impl LobbyManager {
@@ -45,6 +49,7 @@ impl LobbyManager {
             room_next_id: AtomicU64::new(1),
             rooms: Default::default(),
             app_data,
+            bridge_token: config_string("SERVER_BRIDGE_TOKEN", "")
         }
     }
     
@@ -100,6 +105,7 @@ impl LobbyManager {
         //Setup some stuff
         let room_id = self.get_next_room_id();
         info.room_id = room_id;
+        info.room_created_at = duration_since_unix_epoch().map(|d| d.as_secs()).unwrap_or(0);
         conn.set_netid(NETID_HOST); //The connection who created the room has NETID HOST assigned
         log::info!("{:} creating new room {:}", conn, info);
 
@@ -119,8 +125,8 @@ impl LobbyManager {
         }
     }
 
-    pub async fn connection_join_room(&mut self, conn: NetConnection, info: RoomJoinInfo) {
-        log::debug!("connection_join_room {:} info: {:}", conn, info);
+    pub async fn connection_peer_join_room(&mut self, conn: NetConnection, info: RoomJoinInfo) {
+        log::debug!("connection_peer_join_room {:} info: {:}", conn, info);
         
         //Try to retrieve room that wants to be joined
         let room = match self.rooms.get(&info.room_id) {
@@ -150,9 +156,28 @@ impl LobbyManager {
         //Add to room
         if let Some(room) = self.rooms.get_mut(&info.room_id) {
             log::info!("{:} joining a room, info: {:} room: {:}", conn, info, room);
-            room.add_connection(conn).await;
+            room.add_connection(conn, false).await;
         } else {
             log::error!("getting mutable room error when joining, conn {:} info: {:}", conn, info);
+        }
+    }
+
+    pub async fn connection_bridge_join_room(&mut self, conn: NetConnection, room_id: RoomID, token: String) {
+        log::debug!("connection_bridge_join_room {:} room: {:}", conn, room_id);
+        
+        //Check if token is valid
+        if self.bridge_token.is_empty() || token.is_empty() || self.bridge_token != token {
+            Self::connection_close(conn, 1);
+            return;
+        }
+
+        //Try to retrieve room that wants to be bridged
+        if let Some(room) = self.rooms.get_mut(&room_id) {
+            assert_eq!(room.info.room_id, room_id); //ID mismatch not supposed to happen
+            log::info!("{:} bridging a room: {:}", conn, room);
+            room.add_connection(conn, true).await;
+        } else {
+            log::error!("getting mutable room error when bridging, conn {:} room: {:}", conn, room_id);
         }
     }
     
