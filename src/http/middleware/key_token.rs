@@ -42,6 +42,8 @@ pub struct KeyTokenMiddleware<S> {
     key_tokens: KeyTokens,
 }
 
+const AUTH_HEADER_BEARER: &'static str = "Bearer ";
+
 impl<S, B> Service<ServiceRequest> for KeyTokenMiddleware<S>
     where
         S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error>,
@@ -55,30 +57,23 @@ impl<S, B> Service<ServiceRequest> for KeyTokenMiddleware<S>
     forward_ready!(service);
 
     fn call(&self, req: ServiceRequest) -> Self::Future {
-        let authorized = match req.headers()
+        let auth_str = req.headers()
             .get(http::header::AUTHORIZATION)
-            .map(|x| x.to_str().unwrap().to_string()) {
-            Some(ref value) => {
-                if 7 < value.len() && value.starts_with("Bearer ") {
-                    let token = &value[7..];
-                    let mut is_authorized = false;
-                    for valid_token in &self.key_tokens.tokens {
-                        if !valid_token.is_empty() && valid_token == token {
-                            is_authorized = true;
-                            break;
-                        }
-                    }
-                    is_authorized
-                } else {
-                    false //Too short or wrong type
-                }
+            .map(|x| x.to_str());
+
+        let is_authorized = match auth_str {
+            Some(Ok(value)) if value.starts_with(AUTH_HEADER_BEARER) =>
+            {
+                let token = &value[AUTH_HEADER_BEARER.len()..];
+                self.key_tokens.tokens
+                    .iter()
+                    .filter(|t| !t.is_empty())
+                    .any(|t| token == t)
             }
-            None => {
-                false //Missing header
-            }
+            _ => false
         };
 
-        if !authorized {
+        if !is_authorized {
             let (request, _pl) = req.into_parts();
             let response = HttpResponse::Unauthorized()
                 .force_close()
