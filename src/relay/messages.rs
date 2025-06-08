@@ -65,12 +65,15 @@ pub enum NetRelayMessagePeer {
     Close(u32),
     PingResponse(Duration),
     ListLobbyHosts {
+        #[allow(dead_code)]
         game_type: String,
+        #[allow(dead_code)]
         game_version: String,
         format: u16,
     },
     ListLobbies {
         game_type: String,
+        #[allow(dead_code)]
         game_version: String,
         format: u16,
     },
