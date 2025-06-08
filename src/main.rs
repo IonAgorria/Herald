@@ -66,7 +66,7 @@ fn run_http_server(http_bind_address: String, tls_config: Option<ServerConfig>, 
                     server = server.keep_alive(KeepAlive::Timeout(Duration::from_millis(keep_alive)));
                 }
                 if let Some(config) = tls_config {
-                    server.bind_rustls_0_22(http_bind_address, config)
+                    server.bind_rustls_0_23(http_bind_address, config)
                 } else {
                     server.bind(http_bind_address)
                 }?.run().await
