@@ -28,6 +28,9 @@ use crate::netconnection::{codec, NetConnection, StreamMessage};
 use crate::relay::session_manager::{SessionManager, SessionManagerSender};
 use crate::utils::{config_from_str, config_string};
 
+const UDP_PING_DATA: &'static str = "HostPing";
+const UDP_PONG_DATA: &'static str = "HostPong";
+
 pub struct AppData {
     lobby_host: LobbyHost,
     allowed_games_types: Vec<String>,
@@ -117,30 +120,51 @@ fn load_rustls_config() -> io::Result<Option<ServerConfig>> {
     }
 }
 
-pub async fn tcp_listener(session_manager: SessionManagerSender) -> Result<(), io::Error> {
+pub async fn tcp_udp_listener(session_manager: SessionManagerSender) -> Result<(), io::Error> {
     let tcp_address = config_string("SERVER_TCP_BIND_ADDRESS", "0.0.0.0:11654");
+    let udp_address = config_string("SERVER_UDP_BIND_ADDRESS", tcp_address.as_str());
     let tcp_linger = config_from_str::<u64>("SERVER_TCP_LINGER", 1);
     let tcp_timeout = config_from_str::<u64>("SERVER_TCP_TIMEOUT", 60000);
-    let socketaddr = match SocketAddr::from_str(tcp_address.as_str()) {
+
+    let tcp_socketaddr = match SocketAddr::from_str(tcp_address.as_str()) {
         Ok(a) => a,
         Err(err) => {
             log::error!("TCP listener unknown address format: {:} error: {:}", tcp_address, err);
             return Err(io::Error::other(err));
         }
     };
-    log::info!("Binding TCP listener at: {:}", socketaddr);
-    let listener = match tokio::net::TcpListener::bind(socketaddr).await {
+    let udp_socketaddr = match SocketAddr::from_str(udp_address.as_str()) {
+        Ok(a) => a,
+        Err(err) => {
+            log::error!("UDP listener unknown address format: {:} error: {:}", udp_address, err);
+            return Err(io::Error::other(err));
+        }
+    };
+
+    log::info!("Binding TCP listener at: {:}", tcp_socketaddr);
+    let tcp_listener = match tokio::net::TcpListener::bind(tcp_socketaddr).await {
         Ok(l) => {
             l
         }
         Err(err) => {
-            log::error!("Couldn't bind relay to address! {:} {:?}", socketaddr, err);
+            log::error!("Couldn't bind relay to address! {:} {:?}", tcp_socketaddr, err);
             return Err(err);
         }
     };
+    log::info!("Binding UDP listener at: {:}", udp_socketaddr);
+    let udp_socket = match tokio::net::UdpSocket::bind(udp_socketaddr).await {
+        Ok(l) => {
+            l
+        }
+        Err(err) => {
+            log::error!("Couldn't bind relay to address! {:} {:?}", udp_socketaddr, err);
+            return Err(err);
+        }
+    };
+
     tokio::spawn(async move {
         loop {
-            match listener.accept().await {
+            match tcp_listener.accept().await {
                 Ok((stream, addr)) =>  {
                     //Handle connection on a new task to avoid blocking the socket acceptor task
                     let session_manager_task = session_manager.clone();
@@ -166,8 +190,32 @@ pub async fn tcp_listener(session_manager: SessionManagerSender) -> Result<(), i
                     });
                 }
                 Err(err) => {
-                    log::info!("TCP listener accept error: {:}", err);
+                    log::warn!("TCP listener accept error: {:?}", err);
                     return Result::<(), io::Error>::Err(err)
+                }
+            }
+        }
+    });
+
+    tokio::spawn(async move {
+        loop {
+            let mut buf = [0; 1024];
+            loop {
+                match udp_socket.recv_from(&mut buf).await {
+                    Ok((len, addr)) => {
+                        log::debug!("UDP listener recv {:?} {:?} bytes ", len, addr);
+                        if len != UDP_PING_DATA.len() || &buf[..len] != UDP_PING_DATA.as_bytes() {
+                            log::debug!("UDP listener wrong data: {:?}", &buf[..len]);
+                            continue;
+                        } 
+                        if let Err(err) = udp_socket.send_to(UDP_PONG_DATA.as_bytes(), addr).await {
+                            log::warn!("UDP listener send error: {:?}", err);
+                        }
+                    }
+                    Err(err) => {
+                        log::debug!("UDP listener recv error: {:?}", err);
+                        return Result::<(), io::Error>::Err(err)
+                    }
                 }
             }
         }
@@ -213,8 +261,8 @@ async fn setup_app() -> io::Result<()> {
     SessionManager::init(session_manager_queue_rx, app_data.clone());
     app_data.session_manager.ping().await;
 
-    //Start relay listener
-    if let Err(err) = tcp_listener(app_data.session_manager.clone()).await {
+    //Start TCP/UDP relay listeners
+    if let Err(err) = tcp_udp_listener(app_data.session_manager.clone()).await {
         return Err(err);
     }
 
